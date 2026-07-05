@@ -14,5 +14,21 @@
     "agent": "odin",
     "created_at": "2026-07-05T13:17:03.131Z",
     "updated_at": "2026-07-05T13:17:03.131Z"
+  },
+  {
+    "id": "mr83r0ns-ef2afb",
+    "type": "research",
+    "title": "rust-player H.264 播放失敗根因 (cbm 檢視 2026-07-06)",
+    "problem": "H.264 MP4 無法正常播放：decoded=7/241 幀，openh264 大量 Native:16 錯誤，畫面黑或卡頓",
+    "context": "Windows, cargo, openh264 0.9.3, mp4parse 0.17, rust_h265 0.1. 熱點檔 src/player.rs (54 symbols), src/video/{worker,nal,h264,h265,frame}.rs, src/sync/mod.rs, src/render/pipeline.rs",
+    "solution": "核心根因: (1) extradata_to_annex_b 對非標準 avcC byte5 回傳空→config_sent=true→SPS/PPS 從未送達 openh264 (已加 fallback 解析待驗證). (2) pack_i420 用 w/2 而 render 用 div_ceil(2), 奇數寬高造成 UV plane 尺寸不符→render validation 拒絕上傳→黑畫面. (3) decode_loop 從不呼叫 decoder.flush(), B-frame 緩衝尾幀遺失. (4) worker status last_frame_pts 從未更新永遠 0.0. (5) openh264 error_concealment 未啟用. (6) EOF (Ok(None)) 後外層 loop 空轉不停止亦不 flush.",
+    "evidence": "cbm+rust-player 索引 40 files/441 symbols/940 edges. 日誌: extradata_annex_b=0 bytes, config_sent=true, annex_len=41, demuxed=241 decoded=7. 本地讀 frame.rs L44-45 vs pipeline.rs L200-201 確認 UV 尺寸不一致. worker.rs L75-204 確認無 flush 呼叫且 last_frame_pts 未寫入.",
+    "tags": "rust-player,h264,openh264,cbm,playback,yuv420",
+    "source": "D:\\rust-player cbm+rust-player",
+    "status": "partial",
+    "session_id": "ses_0cd97e660ffesnJpMhU87xcijS",
+    "agent": "odin",
+    "created_at": "2026-07-05T18:06:02.008Z",
+    "updated_at": "2026-07-05T18:06:02.008Z"
   }
 ]

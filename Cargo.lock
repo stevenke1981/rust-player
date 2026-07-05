@@ -3180,6 +3180,7 @@ dependencies = [
  "mp4",
  "mp4parse",
  "openh264",
+ "openh264-sys2",
  "parking_lot",
  "pollster",
  "rav1d",

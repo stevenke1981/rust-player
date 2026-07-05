@@ -184,3 +184,54 @@ cargo build --release
 |-------|------------|------|
 | Phase 6 黑畫面修復 | T7.1–T7.3、T8.1–T8.4、T7.U/T8.U 核心單元測試 | ⬜ |
 | Phase 7 架構效能 | `cargo test`、手動 smoke、無明顯回歸 | ⬜ |
+
+---
+
+## T9 — H.264 播放修復回歸測試（CBM 第二輪檢視 2026-07-06）
+
+### T9.1 H.264 extradata / SPS-PPS
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T9.1.1 | `RUST_LOG=debug cargo run -- assets/test_h264.mp4` | log 顯示 `H264Decoder::new`，`extradata_len > 0`，`extradata_annex_b > 0` 或 fallback 成功 |
+| T9.1.2 | 播放 10 秒 | `decoded_frames / demuxed_packets ≥ 95%`，不再只有 `decoded=7/241` 類結果 |
+| T9.1.3 | 觀察 openh264 warning | 無大量連續 `Native:16`；偶發壞幀可跳過但播放不凍結 |
+| T9.1.4 | UI 診斷卡片 | 不停留於 `Decoding` 或 `WaitingForFirstFrame`，且畫面持續更新 |
+
+### T9.2 奇數寬高 YUV plane
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T9.2.1 | 播放奇數高度影片（例如 1920×817） | 無 `u_plane too small` / `v_plane too small` warn |
+| T9.2.2 | 執行 `frame_validation_accepts_odd_dimensions` 單元測試 | `pack_i420` 與 render validation 對 UV 尺寸一致 |
+
+### T9.3 EOF flush / 短片
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T9.3.1 | 播放 < 30 幀 H.264 短片 | 尾幀顯示，播放結束不提前黑畫面 |
+| T9.3.2 | 播放結束後觀察 CPU | worker 不空轉，CPU 使用回落 |
+| T9.3.3 | `decode --frames` 或 no-ui smoke | EOF 時 `decoder.flush()` 產出剩餘 frames |
+
+### T9.4 worker 狀態
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T9.4.1 | 播放任一有畫面影片 | `last_frame_pts` 隨幀更新遞增 |
+| T9.4.2 | decode worker 送出 frame | `WorkerPerFrameStatus.last_frame_pts` 等於最近送出的 frame PTS |
+
+### T9.5 自動驗證命令
+
+```bash
+cargo build
+cargo test
+cargo clippy -- -D warnings
+```
+
+若 `assets/` 未提供素材，T9.1–T9.4 標記為「手動素材缺失」，不可宣告 H.264 播放修復完成。自動測試仍需通過。 
+
+### 新增驗收判定（Phase 9）
+
+| Phase | 必要通過項 | 狀態 |
+|-------|------------|------|
+| Phase 9 H.264 播放修復 | T9.1–T9.4 + build/test/clippy | ⬜ | 潛在素材依賴 |

@@ -247,8 +247,46 @@ impl MediaPlayer {
             worker.poll_frames(&mut self.av_sync);
             // Read worker diagnostic counters
             if let Ok(s) = self.worker_status.lock() {
-                if s.worker_running && s.decoded_frames == 0 && self.clock.position_secs() > 1.0 {
-                    self.waiting_reason = WaitingReason::Decoding;
+                if !s.worker_running && s.decoded_frames == 0 && self.last_video_frame.is_none() {
+                    // Worker stopped without producing any frames — show diagnostic.
+                    if !matches!(
+                        self.waiting_reason,
+                        WaitingReason::CodecUnsupported(_)
+                            | WaitingReason::DemuxError(_)
+                            | WaitingReason::DecodeError(_)
+                            | WaitingReason::NoVideoTrack
+                    ) {
+                        log::warn!(
+                            "video worker stopped without producing frames \
+                             (demuxed={}, worker_running={})",
+                            s.demuxed_packets,
+                            s.worker_running
+                        );
+                        self.waiting_reason = WaitingReason::DecodeError(
+                            "decoder stopped unexpectedly".into(),
+                        );
+                    }
+                } else if s.worker_running
+                    && s.decoded_frames == 0
+                    && self.clock.position_secs() > 1.0
+                {
+                    if self.waiting_reason != WaitingReason::Decoding {
+                        log::info!(
+                            "waiting_reason -> Decoding (clock={:.2}s, demuxed={})",
+                            self.clock.position_secs(),
+                            s.demuxed_packets
+                        );
+                        self.waiting_reason = WaitingReason::Decoding;
+                    }
+                } else if s.decoded_frames > 0 {
+                    // Worker IS producing frames; clear stale error if present.
+                    if matches!(self.waiting_reason, WaitingReason::Decoding) {
+                        log::info!(
+                            "worker produced {} frames, clearing Decoding",
+                            s.decoded_frames
+                        );
+                        self.waiting_reason = WaitingReason::None;
+                    }
                 }
             }
         }

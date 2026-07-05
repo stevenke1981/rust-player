@@ -132,6 +132,53 @@
 - [x] 新增 `sync::tests::sync_seeking_bootstrap_returns_immediately`（seek 首幀即時輸出）
 - [x] 新增 `sync::tests::sync_startup_bootstrap_works_only_once`（bootstrap 只作用一次）
 - [ ] 新增 frame validation 單元測試
-- [ ] 新增 worker status 單元測試（無素材時可 graceful skip）
+- [x] 新增 worker status 單元測試（無素材時可 graceful skip）
+
+### 後續補強
+- [ ] `run_render_only` surface error 處理 ✅ (b586071)
+- [ ] WorkerPerFrameStatus & PlaybackStatus 單元測試 ✅ (51c57b6)
 - [x] `test.md` 增補 T7（黑畫面診斷）、T8（seek/首幀回歸）
 - [x] `final.md` 記錄修復結果、驗證證據與剩餘風險
+
+---
+
+## Phase 9 — H.264 播放修復（CBM 第二輪檢視 2026-07-06，最高優先）
+
+根因與規格詳見 `spec.md §10`、`plan.md Phase 9`。
+
+### 9A extradata / SPS-PPS 修復（P0，R1）
+- [~] `extradata_to_annex_b()` 加入 fallback：標準 AVCC → HVCC → 強制 AVCC，皆失敗才回空（已實作，待實測）
+- [~] `H264Decoder::new()` 加入 extradata hex debug log（已實作）
+- [ ] 實測 H.264 MP4：確認 `decoded_frames / demuxed_packets ≥ 95%`
+- [ ] 檢視 `config_sent` 邏輯：extradata 非空但解析空時，不應無條件跳過首幀 SPS/PPS
+- [ ] H.265 路徑套用同樣 fallback 驗證
+
+### 9B YUV 平面尺寸一致（P0，R2）
+- [ ] `pack_i420()` 的 `uv_w`/`uv_h` 由 `w/2`、`h/2` 改為 `w.div_ceil(2)`、`h.div_ceil(2)`
+- [ ] 確認與 `render/pipeline.rs::upload_frame`（L200-201）、`create_plane_textures` 一致
+- [ ] 新增奇數寬高 frame validation 單元測試
+
+### 9C 解碼結束 flush 與 EOF（P1，R3/R6）
+- [ ] `decode_loop()` demux EOF 時呼叫 `decoder.flush()` 並送出尾幀
+- [ ] EOF 後標記 end-of-stream，降頻/阻塞等待命令，消除空轉
+- [ ] 短片（< 30 幀）驗證尾幀不遺失
+
+### 9D worker 狀態完整（P1，R4）
+- [ ] 送出 frame 時更新 `WorkerPerFrameStatus.last_frame_pts`
+- [ ] UI 診斷卡片確認 last_frame_pts 遞增
+
+### 9E openh264 抗損（P2，R5）
+- [ ] `H264Decoder` 啟用 error concealment 設定
+- [ ] 驗證單一壞幀不造成連續 `Native:16`
+
+### 9F 測試素材與回歸
+- [ ] 產生極小合成 H.264 / AV1 clip 置於 `assets/`
+- [ ] 加入 `decode --frames N` smoke test（有素材時）
+- [ ] `cargo build` / `cargo test` / `cargo clippy -- -D warnings` 全綠
+
+### 9G 優化建議（路線圖，非阻塞）
+- [ ] 拆分 `src/player.rs`（54 symbols）為 `player/{app,media,compositor,status}.rs`
+- [ ] decode worker 自適應 sleep（依 queue 飽和度）
+- [ ] `AudioOutput` 支援 I16/U16 output format
+- [ ] 色彩矩陣依 metadata 選 BT.601/BT.709 + limited/full range
+- [ ] UI 顯示 codec / 解析度 / fps / decoded-demuxed 比率

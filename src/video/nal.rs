@@ -32,13 +32,36 @@ pub fn extradata_to_annex_b(extradata: &[u8]) -> Vec<u8> {
     if extradata.len() < 6 {
         return Vec::new();
     }
+
+    // Standard AVCC (H.264): byte 5 upper 3 bits must be 111 (reserved).
     if (extradata[5] & 0xe0) == 0xe0 {
-        parse_avcc(extradata)
-    } else if extradata.len() >= 23 {
-        parse_hvcc(extradata).unwrap_or_default()
-    } else {
-        Vec::new()
+        let result = parse_avcc(extradata);
+        if !result.is_empty() {
+            return result;
+        }
     }
+
+    // Standard HVCC (H.265): needs at least 23 bytes.
+    if extradata.len() >= 23 {
+        if let Some(result) = parse_hvcc(extradata) {
+            if !result.is_empty() {
+                return result;
+            }
+        }
+    }
+
+    // Fallback: some files have non-standard AVCC where byte 5 reserved bits
+    // are not set correctly. Try to parse as AVCC directly.
+    let result = parse_avcc(extradata);
+    if !result.is_empty() {
+        log::debug!(
+            "extradata_to_annex_b: fallback AVCC parse succeeded (byte5=0x{:02x}, len={})",
+            extradata[5], extradata.len()
+        );
+        return result;
+    }
+
+    Vec::new()
 }
 
 fn parse_avcc(avcc: &[u8]) -> Vec<u8> {
@@ -139,15 +162,23 @@ fn read_be_uint(data: &[u8], bytes: usize) -> usize {
 }
 
 pub fn nal_length_size_from_extradata(extradata: &[u8]) -> u8 {
-    if extradata.is_empty() {
-        return 4;
-    }
-    if extradata[0] == 1 && extradata.len() >= 22 {
-        return (extradata[21] & 0x03) + 1;
-    }
+    // Standard AVCC (H.264) / HVCC (H.265) layout:
+    //   byte 4 = reserved(6 bits) | lengthSizeMinusOne(2 bits)
+    // See ISO 14496-15 §5.3.3.1.1 (AVCDecoderConfigurationRecord) and §8.3.3.1.1.
     if extradata.len() >= 5 {
-        return (extradata[4] & 0x03) + 1;
+        let nalu_size = (extradata[4] & 0x03) + 1;
+        log::debug!(
+            "nal_length_size_from_extradata: len={}, byte4=0x{:02x} → nalu_size={}",
+            extradata.len(),
+            extradata[4],
+            nalu_size
+        );
+        return nalu_size;
     }
+    log::debug!(
+        "nal_length_size_from_extradata: short extradata (len={}), defaulting to 4",
+        extradata.len()
+    );
     4
 }
 

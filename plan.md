@@ -243,3 +243,49 @@ rust-player/
 | 4 | Frame validation + 奇數尺寸 | plane mismatch 有明確錯誤 |
 | 5 | 補測試與文件 | `cargo test` 通過，test.md T7/T8 可執行 |
 | 6 | 拆分 `player.rs` 與減少 frame clone | 無行為回歸，效能風險降低 |
+
+---
+
+## Phase 9 — H.264 播放修復計畫（CBM 第二輪檢視 2026-07-06）
+
+### 範圍與完成定義
+
+**目標**：修復 H.264 MP4「無法正常播放」（decoded=7/241、大量 openh264 `Native:16`、黑畫面/卡頓），並依 CBM 證據提出可驗證的優化。
+
+**在範圍**：`src/video/{nal,h264,h265,worker,frame}.rs`、`src/render/pipeline.rs`、`src/sync/mod.rs` 的最小必要修改；五份文件更新。
+
+**不在範圍**：不新增大型媒體框架、不重寫播放器、不改 Git 歷史、不動使用者資料、不引入硬體解碼。
+
+**完成定義**：
+1. H.264 MP4 起播後 `decoded_frames / demuxed_packets ≥ 95%`。
+2. 奇數寬高影片可上傳顯示，無 frame validation warn。
+3. 短片尾幀不遺失（EOF flush 生效）。
+4. `cargo build`、`cargo test`、`cargo clippy -- -D warnings` 全綠。
+
+### 根因對應任務（詳見 spec.md §10）
+
+| ID | 根因 | 任務 | 檔案 | 優先 |
+|----|------|------|------|------|
+| P9-1 | R1 extradata 空→SPS/PPS 未送 | extradata_to_annex_b fallback + hex log + config_sent 修正 | `src/video/nal.rs`、`src/video/h264.rs` | P0 |
+| P9-2 | R2 UV 尺寸不一致 | `pack_i420` 改用 `div_ceil(2)` 與 render 對齊 | `src/video/frame.rs` | P0 |
+| P9-3 | R3/R6 無 flush、EOF 空轉 | decode_loop EOF flush + end-of-stream 標記 | `src/video/worker.rs` | P1 |
+| P9-4 | R4 last_frame_pts 未更新 | 送 frame 時更新 pts | `src/video/worker.rs` | P1 |
+| P9-5 | R5 抗損性 | openh264 error concealment 設定 | `src/video/h264.rs` | P2 |
+
+### 建議實作順序
+
+| 順序 | 任務 | 驗收 |
+|------|------|------|
+| 1 | P9-1 extradata 修復（已部分實作 fallback，待實測） | H.264 起播 decoded≈demuxed，log 無 `extradata_annex_b=0` 致命路徑 |
+| 2 | P9-2 UV 尺寸一致 | 奇數尺寸幀無 validation warn |
+| 3 | P9-3 EOF flush | 短片尾幀完整、CPU 空轉消除 |
+| 4 | P9-4 last_frame_pts | UI 進度診斷正確 |
+| 5 | P9-5 抗損 + 測試素材 | 壞幀不連鎖；smoke test 可跑 |
+
+### 風險與緩解
+
+| 風險 | 緩解 |
+|------|------|
+| 無測試素材無法自動驗收 | 產生極小合成 H.264/AV1 clip 進 `assets/`（gitignore 保留樣本或 CI 生成） |
+| fallback AVCC 誤解析 HVCC | 先試標準路徑、再 HVCC、最後才 fallback，且皆有 bounds check |
+| flush 時序不當造成 openh264 錯誤 | 僅於 EOF 呼叫一次 flush，參考 openh264 `flush_remaining()` |

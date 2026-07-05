@@ -378,3 +378,60 @@ cargo run --release -- test_av1.mp4
 - H.264/MP4：實驗支援，需補足測試素材與錯誤回報。
 - H.265/MP4：實驗支援，需確認 `rust_h265` 解碼能力與實測限制。
 - 不支援或失敗的 codec 必須顯示清楚錯誤，不得靜默黑畫面。
+
+---
+
+## 10. CBM 再檢視 — H.264 無法正常播放修復規格（2026-07-06）
+
+### 10.1 CBM 索引摘要（第二輪）
+
+- 專案：`cbm+rust-player`
+- 索引結果：40 files、441 symbols、940 edges（CONTAINS 440 / CALLS 333 / IMPORTS 161 / IMPLEMENTS 6）
+- 符號熱點（`symbols` 表統計）：`src/player.rs`(54)、`src/i18n/mod.rs`(33)、`src/video/demux.rs`(27)、`src/audio/sink.rs`(23)、`src/audio/output.rs`(21)、`src/sync/mod.rs`(20)、`src/render/pipeline.rs`(18)。
+- 現象：H.264 MP4 拖入後畫面黑或嚴重卡頓；debug log 顯示 `extradata_annex_b=0 bytes`、`config_sent=true`、`annex_len=41`、`demuxed=241 decoded=7`、openh264 大量 `Native:16`。
+
+### 10.2 根因清單（依證據排序）
+
+| # | 根因 | 證據 | 影響 |
+|---|------|------|------|
+| R1 | `extradata_to_annex_b()` 對非標準 avcC（byte5 保留位非 `111`）回傳空 → `config_sent = extradata_annex_b.is_empty()` 為 true → SPS/PPS 永不送達 openh264 | `src/video/nal.rs` L31-42、`src/video/h264.rs` L25；log `extradata_annex_b=0` | 幾乎所有幀解碼失敗（decoded=7/241） |
+| R2 | `pack_i420()` 用 `w/2`、`h/2` 計算 UV 平面，`upload_frame()` 用 `div_ceil(2)` 驗證；奇數寬高時 UV 尺寸不符 → validation 拒絕上傳 | `src/video/frame.rs` L44-45 vs `src/render/pipeline.rs` L200-201 | 奇數尺寸影片永久黑畫面 |
+| R3 | `decode_loop()` 從不呼叫 `decoder.flush()`；openh264/HEVC 內部緩衝的尾幀與 B-frame 重排幀遺失 | `src/video/worker.rs` L125-204 無 flush 呼叫 | 尾段幀遺失、短片可能整片無輸出 |
+| R4 | worker `last_frame_pts` 從未寫入，恆為 0.0 | `src/video/worker.rs` 僅寫 demuxed/decoded；`playback_status()` 讀 `last_frame_pts` | UI 進度/診斷顯示錯誤 |
+| R5 | openh264 decoder 未啟用 error concealment，單一壞幀後續放大為連續錯誤 | `src/video/h264.rs` `Decoder::new()` 用預設 config | 抗損性差、卡頓 |
+| R6 | demux EOF（`Ok(None)`）後外層 loop 持續空轉，不 flush、不標記 end-of-stream | `src/video/worker.rs` L143 `break` 後續圈空轉 | 播放結束後尾幀不出、CPU 空耗 |
+
+### 10.3 修復規格
+
+1. **extradata 解析健壯化（R1，最高優先）**
+   - `extradata_to_annex_b()` 必須：標準路徑失敗時，仍嘗試 AVCC 解析；再失敗嘗試 HVCC；皆失敗才回空。
+   - 當 `extradata_annex_b` 為空但 extradata 非空時，`config_sent` 不得無條件設 true；需保留在首個關鍵幀嘗試 in-band SPS/PPS。
+   - 必須輸出 extradata 前 32 bytes 的 hex debug log 以利診斷。
+   - 驗收：H.264 MP4 起播後 `decoded_frames` 接近 `demuxed_packets`（≥ 95%）。
+
+2. **YUV 平面尺寸一致（R2）**
+   - `pack_i420()` 與 `upload_frame()`／`create_plane_textures()` 必須採用相同 UV 尺寸公式：`div_ceil(2)`。
+   - 驗收：奇數寬高（如 1920×817）測試幀可正常上傳，無 validation warn。
+
+3. **解碼結束 flush（R3、R6）**
+   - demux 到 EOF 時呼叫 `decoder.flush()`，將尾幀送入 queue，並將 worker 標記 end-of-stream，之後降頻或阻塞等待命令。
+   - 驗收：短片（< 30 幀）輸出幀數 = 實際可解碼幀數；播放結束 CPU 使用回落。
+
+4. **worker 狀態完整（R4）**
+   - 每次成功送出 frame 更新 `last_frame_pts = frame.pts_secs`。
+   - 驗收：UI 診斷卡片 last_frame_pts 隨播放遞增。
+
+5. **openh264 抗損（R5）**
+   - decoder 啟用 error concealment（`DecoderConfig`）與適當 flush 策略。
+   - 驗收：單一損壞幀不致造成後續連續 `Native:16`。
+
+### 10.4 功能優化建議（非阻塞，路線圖）
+
+| 類別 | 建議 | 價值 |
+|------|------|------|
+| 架構 | 拆分 `src/player.rs`（54 symbols）為 `player/{app,media,compositor,status}.rs` | 降低單檔複雜度與維護風險 |
+| 效能 | decode worker 依 queue 飽和度自適應 sleep，取代固定 1/5ms | 降低 CPU 空轉 |
+| 相容 | `AudioOutput` 支援 I16/U16 output format | 減少 virtual sink fallback |
+| 色彩 | 依 codec metadata 選 BT.601/BT.709 + limited/full range（shader uniform） | 正確色彩 |
+| 診斷 | UI 顯示 codec、解析度、fps、decoded/demuxed 比率 | 使用者可見健康度 |
+| 測試 | 加入極小合成 H.264/AV1 素材進 `assets/`，納入 smoke test | 可自動回歸 |

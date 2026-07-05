@@ -84,6 +84,8 @@ fn decode_loop(
     {
         let mut s = status.lock().unwrap();
         s.worker_running = true;
+        s.demuxed_packets = 0;
+        s.decoded_frames = 0;
     }
 
     let mut demuxer = match Mp4Demuxer::open(&path) {
@@ -97,10 +99,11 @@ fn decode_loop(
         }
     };
 
-    let mut decoder = match VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata()) {
+    let codec = demuxer.video_codec();
+    let mut decoder = match VideoDecoder::for_codec(codec, demuxer.extradata()) {
         Ok(d) => d,
         Err(e) => {
-            let msg = format!("decoder init failed: {e}");
+            let msg = format!("decoder init failed for {:?}: {e}", codec);
             log::error!("video worker: {msg}");
             let mut s = status.lock().unwrap();
             s.worker_running = false;
@@ -110,13 +113,16 @@ fn decode_loop(
 
     log::info!(
         "video decode thread started: codec={:?}, samples={}",
-        demuxer.video_codec(),
-        demuxer.sample_count()
+        codec,
+        demuxer.sample_count(),
     );
 
     // Track demux/decode counts locally to reduce lock contention.
     let mut local_demuxed: u64 = 0;
     let mut local_decoded: u64 = 0;
+    let mut local_last_pts: f64 = 0.0;
+    let mut heartbeat_countdown = 250;
+    let mut eof = false;
 
     loop {
         let cmd = drain_commands(&mut demuxer, &mut decoder, &cmd_rx);
@@ -125,8 +131,48 @@ fn decode_loop(
             CommandAction::Seeked => {
                 local_demuxed = 0;
                 local_decoded = 0;
+                local_last_pts = 0.0;
+                eof = false;
             }
             CommandAction::None => {}
+        }
+
+        if eof {
+            // Flush decoder to drain any output frames buffered internally
+            // (openh264, dav1d, and libde265 all buffer frames across packets).
+            match decoder.flush() {
+                Ok(flushed) => {
+                    for frame in flushed {
+                        local_decoded += 1;
+                        if frame.pts_secs > local_last_pts {
+                            local_last_pts = frame.pts_secs;
+                        }
+                        if frame_tx.send(frame).is_err() {
+                            // Receiver dropped (player closing).
+                            let mut s = status.lock().unwrap();
+                            s.demuxed_packets = local_demuxed;
+                            s.decoded_frames = local_decoded;
+                            s.last_frame_pts = local_last_pts;
+                            s.worker_running = false;
+                            return;
+                        }
+                    }
+                }
+                Err(e) => {
+                    log::warn!("video worker decoder flush error: {e}");
+                }
+            }
+
+            // Mark end-of-stream and exit the worker thread.
+            let mut s = status.lock().unwrap();
+            s.demuxed_packets = local_demuxed;
+            s.decoded_frames = local_decoded;
+            s.last_frame_pts = local_last_pts;
+            s.worker_running = false;
+            log::info!(
+                "video worker end-of-stream: demuxed={local_demuxed} decoded={local_decoded}",
+            );
+            return;
         }
 
         let mut decoded_any = false;
@@ -136,7 +182,10 @@ fn decode_loop(
                     local_demuxed += 1;
                     p
                 }
-                Ok(None) => break,
+                Ok(None) => {
+                    eof = true;
+                    break;
+                }
                 Err(e) => {
                     log::debug!("video worker demux: {e}");
                     let mut s = status.lock().unwrap();
@@ -157,10 +206,14 @@ fn decode_loop(
 
             for frame in frames {
                 local_decoded += 1;
+                if frame.pts_secs > local_last_pts {
+                    local_last_pts = frame.pts_secs;
+                }
                 if frame_tx.send(frame).is_err() {
                     let mut s = status.lock().unwrap();
                     s.demuxed_packets = local_demuxed;
                     s.decoded_frames = local_decoded;
+                    s.last_frame_pts = local_last_pts;
                     s.worker_running = false;
                     return;
                 }
@@ -173,6 +226,17 @@ fn decode_loop(
             let mut s = status.lock().unwrap();
             s.demuxed_packets = local_demuxed;
             s.decoded_frames = local_decoded;
+            s.last_frame_pts = local_last_pts;
+        }
+
+        // Periodic heartbeat log (every ~250 iterations / ~few seconds).
+        if heartbeat_countdown == 0 {
+            log::info!(
+                "video worker heartbeat: demuxed={local_demuxed} decoded={local_decoded}",
+            );
+            heartbeat_countdown = 250;
+        } else {
+            heartbeat_countdown -= 1;
         }
 
         if !decoded_any {
@@ -182,11 +246,12 @@ fn decode_loop(
         }
     }
 
-    // Worker loop ended normally.
+    // Worker loop ended via Shutdown command (player closing).
     let mut s = status.lock().unwrap();
     s.worker_running = false;
     s.demuxed_packets = local_demuxed;
     s.decoded_frames = local_decoded;
+    s.last_frame_pts = local_last_pts;
 }
 
 enum CommandAction {

@@ -10,6 +10,7 @@ cpal = "0.15"
 mp4 = "0.14"
 mp4parse = { version = "0.17", features = ["unstable-api"] }
 openh264 = { version = "0.9", default-features = false, features = ["source"] }
+openh264-sys2 = "0.9"
 rust_h265 = "0.1"
 rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
 wgpu = "24"
