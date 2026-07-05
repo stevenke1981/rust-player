@@ -185,6 +185,15 @@ impl Locale {
         }
     }
 
+    pub fn virtual_audio_warning(self) -> &'static str {
+        match self.lang {
+            Language::ZhHant => "無音訊輸出裝置，已啟用虛擬音訊（僅同步時間軸）",
+            Language::ZhHans => "无音频输出设备，已启用虚拟音频（仅同步时间轴）",
+            Language::En => "No audio output device; using virtual audio (clock sync only)",
+            Language::Ja => "音声出力デバイスなし。仮想音声で同期のみ",
+        }
+    }
+
     pub fn headless_requires_path(self) -> &'static str {
         match self.lang {
             Language::ZhHant => "無介面模式需要指定媒體檔案路徑",
@@ -206,6 +215,7 @@ impl Locale {
   rust-player audio <檔案> [--progress]    Phase 1：音訊播放
   rust-player decode <檔案> [--frames N]     Phase 2：視訊解碼
   rust-player render <檔案>                Phase 3：GPU 渲染
+  rust-player <URL>                        Phase 8：HTTP / HLS 串流
   rust-player help
 
 語言（--lang）：

@@ -41,6 +41,7 @@ pub struct Mp4Demuxer {
     timescale: u32,
     codec: VideoCodec,
     extradata: Vec<u8>,
+    duration_secs: Option<f64>,
 }
 
 impl Mp4Demuxer {
@@ -64,6 +65,10 @@ impl Mp4Demuxer {
             return Err(PlayerError::VideoDemux("no samples in track".into()));
         }
 
+        let duration_secs = samples
+            .last()
+            .map(|s| s.end_composition.0 as f64 / timescale as f64);
+
         Ok(Self {
             backend: DemuxBackend::Mp4parse {
                 file,
@@ -73,6 +78,7 @@ impl Mp4Demuxer {
             timescale,
             codec,
             extradata,
+            duration_secs,
         })
     }
 
@@ -80,7 +86,7 @@ impl Mp4Demuxer {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
         let reader = BufReader::new(file);
-        let mp4 = mp4::Mp4Reader::read_header(reader, size)
+        let mut mp4 = mp4::Mp4Reader::read_header(reader, size)
             .map_err(|e| PlayerError::VideoDemux(e.to_string()))?;
 
         let (track_id, codec, extradata, timescale, sample_count) =
@@ -90,6 +96,12 @@ impl Mp4Demuxer {
         if sample_count == 0 {
             return Err(PlayerError::VideoDemux("no samples in track".into()));
         }
+
+        let duration_secs = mp4
+            .read_sample(track_id, sample_count)
+            .ok()
+            .flatten()
+            .map(|s| (s.start_time + s.duration as u64) as f64 / timescale as f64);
 
         Ok(Self {
             backend: DemuxBackend::Mp4Crate {
@@ -101,6 +113,7 @@ impl Mp4Demuxer {
             timescale,
             codec,
             extradata,
+            duration_secs,
         })
     }
 
@@ -121,6 +134,10 @@ impl Mp4Demuxer {
             DemuxBackend::Mp4parse { samples, .. } => samples.len() as u32,
             DemuxBackend::Mp4Crate { sample_count, .. } => *sample_count,
         }
+    }
+
+    pub fn duration_secs(&self) -> Option<f64> {
+        self.duration_secs
     }
 
     pub fn next_packet(&mut self) -> Result<Option<VideoPacket>> {

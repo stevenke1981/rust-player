@@ -25,6 +25,7 @@ env_logger = "0.11"
 bytemuck = { version = "1", features = ["derive"] }
 libc = "0.2"
 rfd = "0.15"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"

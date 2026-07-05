@@ -1,3 +1,4 @@
+mod fonts;
 mod theme;
 
 use egui::{Align2, Color32, FontId, Frame, Order, RichText, Stroke};
@@ -5,6 +6,7 @@ use egui::{Align2, Color32, FontId, Frame, Order, RichText, Stroke};
 use crate::audio::PlaybackClock;
 use crate::i18n::{Language, Locale};
 
+pub use fonts::setup_fonts;
 pub use theme::apply_theme;
 
 pub struct PlayerUiState {
@@ -41,6 +43,8 @@ pub struct PlayerView<'a> {
     pub has_media: bool,
     pub drag_active: bool,
     pub error: Option<&'a str>,
+    pub warning: Option<&'a str>,
+    pub subtitle: Option<&'a str>,
 }
 
 pub fn draw_player_ui(
@@ -52,6 +56,8 @@ pub fn draw_player_ui(
     draw_title_bar(ctx, view, state, locale);
     draw_control_bar(ctx, view, state, locale);
     draw_drop_overlay(ctx, view, locale);
+    draw_subtitle_overlay(ctx, view.subtitle);
+    draw_warning_toast(ctx, view.warning);
     draw_error_toast(ctx, view.error);
 }
 
@@ -307,6 +313,56 @@ fn draw_drop_overlay(ctx: &egui::Context, view: &PlayerView<'_>, locale: &Locale
                 FontId::proportional(13.0),
                 theme::TEXT_DIM,
             );
+        });
+}
+
+fn draw_subtitle_overlay(ctx: &egui::Context, text: Option<&str>) {
+    let Some(text) = text else {
+        return;
+    };
+    if text.is_empty() {
+        return;
+    }
+
+    egui::Area::new(egui::Id::new("subtitle_overlay"))
+        .order(Order::Foreground)
+        .anchor(Align2::CENTER_BOTTOM, egui::vec2(0.0, -72.0))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_black_alpha(160))
+                .inner_margin(egui::Margin::symmetric(16, 8))
+                .corner_radius(egui::CornerRadius::same(4))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(text)
+                            .size(18.0)
+                            .color(Color32::WHITE),
+                    );
+                });
+        });
+}
+
+fn draw_warning_toast(ctx: &egui::Context, warning: Option<&str>) {
+    let Some(msg) = warning else {
+        return;
+    };
+
+    egui::Area::new(egui::Id::new("warning_toast"))
+        .order(Order::Tooltip)
+        .anchor(Align2::LEFT_TOP, egui::vec2(16.0, 52.0))
+        .show(ctx, |ui| {
+            Frame::new()
+                .fill(Color32::from_rgb(60, 48, 20))
+                .stroke(Stroke::new(1.0, Color32::from_rgb(200, 160, 60)))
+                .corner_radius(egui::CornerRadius::same(6))
+                .inner_margin(egui::Margin::symmetric(12, 8))
+                .show(ui, |ui| {
+                    ui.label(
+                        RichText::new(format!("⚠ {msg}"))
+                            .size(12.0)
+                            .color(Color32::from_rgb(255, 220, 160)),
+                    );
+                });
         });
 }
 

@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use egui_wgpu::Renderer as EguiRenderer;
 use egui_winit::State as EguiWinitState;
@@ -10,35 +10,42 @@ use winit::keyboard::{Key, NamedKey};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::window::{Window, WindowId};
 
-use crate::audio::{AudioDecoder, AudioOutput, PlaybackClock};
+use crate::audio::{AudioDecoder, AudioSink, PlaybackClock};
 use crate::error::{PlayerError, Result};
 use crate::i18n::{Language, Locale};
 use crate::render::RenderPipeline;
+use crate::stream::{is_stream_url, resolve_media_source};
+use crate::subtitle::SubtitleTrack;
 use crate::sync::AvSync;
-use crate::ui::{apply_theme, draw_player_ui, PlayerUiState, PlayerView};
+use crate::ui::{apply_theme, draw_player_ui, setup_fonts, PlayerUiState, PlayerView};
 use crate::video::{DecodedFrame, Mp4Demuxer, VideoDecodeWorker, VideoDecoder};
 
-const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4a", "mp3"];
+const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4a", "mp3", "ts"];
 
 const AUDIO_PREFILL_SAMPLES: usize = 4096;
 
 pub struct MediaPlayer {
     audio_decoder: Option<AudioDecoder>,
     video_worker: Option<VideoDecodeWorker>,
-    audio_output: AudioOutput,
+    audio_sink: AudioSink,
     clock: Arc<PlaybackClock>,
     av_sync: AvSync,
+    subtitles: Option<SubtitleTrack>,
     pending_audio: Vec<f32>,
     output_playing: bool,
     last_volume: f32,
+    video_only_clock: bool,
+    last_tick: Instant,
 }
 
 impl MediaPlayer {
     pub fn open(path: &Path) -> Result<Self> {
-        let video_info = Mp4Demuxer::open(path).ok().map(|d| {
+        let demuxer = Mp4Demuxer::open(path).ok();
+        let video_info = demuxer.as_ref().map(|d| {
             (
                 d.video_codec(),
                 d.extradata().to_vec(),
+                d.duration_secs(),
             )
         });
         let has_video = video_info.is_some();
@@ -46,12 +53,10 @@ impl MediaPlayer {
         let audio_decoder = AudioDecoder::open(path).ok();
         let (sample_rate, channels, duration) = if let Some(ref dec) = audio_decoder {
             (dec.sample_rate(), dec.channels(), dec.duration_secs())
-        } else if has_video {
-            (48_000, 2, Some(10.0))
+        } else if let Some((_, _, dur)) = video_info {
+            (48_000, 2, dur)
         } else {
-            return Err(crate::error::PlayerError::AudioDecode(
-                "no audio or video track".into(),
-            ));
+            return Err(PlayerError::AudioDecode("no audio or video track".into()));
         };
 
         let clock = Arc::new(PlaybackClock::new(sample_rate, duration));
@@ -59,8 +64,8 @@ impl MediaPlayer {
             clock.set_duration_secs(d);
         }
 
-        let audio_output = AudioOutput::new(sample_rate, channels, clock.clone())?;
-        let video_worker = if let Some((codec, extradata)) = video_info {
+        let audio_sink = AudioSink::try_new(sample_rate, channels, clock.clone())?;
+        let video_worker = if let Some((codec, extradata, _)) = video_info {
             Some(VideoDecodeWorker::spawn(
                 path.to_path_buf(),
                 codec,
@@ -70,17 +75,33 @@ impl MediaPlayer {
             None
         };
         let av_sync = AvSync::new(clock.clone());
+        let subtitles = SubtitleTrack::load_sidecar(path);
+        let video_only_clock = audio_decoder.is_none() && has_video;
 
         Ok(Self {
             audio_decoder,
             video_worker,
-            audio_output,
+            audio_sink,
             clock,
             av_sync,
+            subtitles,
             pending_audio: Vec::new(),
             output_playing: false,
             last_volume: 1.0,
+            video_only_clock,
+            last_tick: Instant::now(),
         })
+    }
+
+    pub fn uses_virtual_audio(&self) -> bool {
+        self.audio_sink.is_virtual()
+    }
+
+    pub fn subtitle_at(&self, time_secs: f64) -> Option<&str> {
+        self.subtitles
+            .as_ref()
+            .and_then(|t| t.cue_at(time_secs))
+            .map(|c| c.text.as_str())
     }
 
     pub fn clock(&self) -> Arc<PlaybackClock> {
@@ -90,19 +111,27 @@ impl MediaPlayer {
     pub fn tick(&mut self, playing: bool) -> Option<DecodedFrame> {
         if playing {
             if !self.output_playing {
-                self.audio_output.resume();
+                self.audio_sink.resume();
                 self.output_playing = true;
+                self.last_tick = Instant::now();
             }
         } else {
             if self.output_playing {
-                self.audio_output.pause();
+                self.audio_sink.pause();
                 self.output_playing = false;
             }
             return None;
         }
 
-        let channels = self.audio_output.channels() as usize;
-        let prefill_threshold = self.audio_output.sample_rate() as usize * channels / 5;
+        if self.video_only_clock {
+            let elapsed = self.last_tick.elapsed();
+            self.last_tick = Instant::now();
+            let pos = self.clock.position_secs() + elapsed.as_secs_f64();
+            self.clock.seek(pos);
+        }
+
+        let channels = self.audio_sink.channels() as usize;
+        let prefill_threshold = self.audio_sink.sample_rate() as usize * channels / 5;
 
         if let Some(dec) = &mut self.audio_decoder {
             while self.pending_audio.len() < prefill_threshold {
@@ -115,7 +144,7 @@ impl MediaPlayer {
         }
         if !self.pending_audio.is_empty() {
             let chunk = self.pending_audio.len().min(AUDIO_PREFILL_SAMPLES);
-            let _ = self.audio_output.write(&self.pending_audio[..chunk]);
+            let _ = self.audio_sink.write(&self.pending_audio[..chunk]);
             self.pending_audio.drain(..chunk);
         }
 
@@ -127,7 +156,7 @@ impl MediaPlayer {
     }
 
     pub fn set_volume(&self, level: f32) {
-        self.audio_output.set_volume(level);
+        self.audio_sink.set_volume(level);
     }
 
     pub fn handle_ui(&mut self, state: &mut PlayerUiState) {
@@ -157,7 +186,8 @@ impl MediaPlayer {
     }
 
     pub fn seek(&mut self, position_secs: f64) -> Result<()> {
-        self.audio_output.clear();
+        self.audio_sink.clear();
+        self.last_tick = Instant::now();
         self.pending_audio.clear();
         self.av_sync.clear();
         if let Some(dec) = &mut self.audio_decoder {
@@ -180,9 +210,20 @@ impl MediaPlayer {
 }
 
 pub fn run_player(path: Option<&Path>, no_ui: bool, lang: Language) -> Result<()> {
-    match (path, no_ui) {
+    let resolved = path
+        .map(|p| {
+            let s = p.to_string_lossy();
+            if is_stream_url(&s) {
+                resolve_media_source(&s)
+            } else {
+                Ok(p.to_path_buf())
+            }
+        })
+        .transpose()?;
+
+    match (resolved.as_deref(), no_ui) {
         (Some(p), true) => run_headless(p),
-        (_, true) => {
+        (None, true) => {
             let loc = Locale::new(lang);
             Err(PlayerError::Unsupported(loc.headless_requires_path().into()))
         }
@@ -220,9 +261,12 @@ struct PlayerApp {
     path: Option<PathBuf>,
     file_hover: bool,
     load_error: Option<String>,
+    load_warning: Option<String>,
     theme_applied: bool,
+    fonts_applied: bool,
     modifiers: Modifiers,
     locale: Locale,
+    stream_temp: Option<PathBuf>,
 }
 
 impl PlayerApp {
@@ -238,15 +282,34 @@ impl PlayerApp {
             path,
             file_hover: false,
             load_error: None,
+            load_warning: None,
             theme_applied: false,
+            fonts_applied: false,
             modifiers: Modifiers::default(),
             locale: Locale::new(lang),
+            stream_temp: None,
         }
     }
 
     fn load_media(&mut self, path: PathBuf) {
-        if !is_media_file(&path) {
-            let ext = path
+        let path_str = path.to_string_lossy();
+        let resolved = if is_stream_url(&path_str) {
+            match resolve_media_source(&path_str) {
+                Ok(p) => {
+                    self.stream_temp = Some(p.clone());
+                    p
+                }
+                Err(e) => {
+                    self.load_error = Some(e.to_string());
+                    return;
+                }
+            }
+        } else {
+            path
+        };
+
+        if !is_media_file(&resolved) {
+            let ext = resolved
                 .extension()
                 .map(|e| e.to_string_lossy().to_string())
                 .unwrap_or_else(|| self.locale.unknown_extension().to_string());
@@ -254,19 +317,24 @@ impl PlayerApp {
             return;
         }
 
-        match MediaPlayer::open(&path) {
+        match MediaPlayer::open(&resolved) {
             Ok(player) => {
+                self.load_warning = if player.uses_virtual_audio() {
+                    Some(self.locale.virtual_audio_warning().to_string())
+                } else {
+                    None
+                };
                 self.player = Some(player);
-                self.path = Some(path.clone());
+                self.path = Some(resolved.clone());
                 self.ui_state.is_playing = true;
                 self.ui_state.seek_preview = None;
                 self.load_error = None;
-                self.set_window_title(&path);
-                log::info!("loaded media: {}", path.display());
+                self.set_window_title(&resolved);
+                log::info!("loaded media: {}", resolved.display());
             }
             Err(e) => {
                 self.load_error = Some(e.to_string());
-                log::error!("failed to open {}: {e}", path.display());
+                log::error!("failed to open {}: {e}", resolved.display());
             }
         }
     }
@@ -439,6 +507,10 @@ impl ApplicationHandler for PlayerApp {
 
 impl PlayerApp {
     fn redraw(&mut self, window: &Window) {
+        if !self.fonts_applied {
+            setup_fonts(&self.egui_ctx);
+            self.fonts_applied = true;
+        }
         if !self.theme_applied {
             apply_theme(&self.egui_ctx);
             self.theme_applied = true;
@@ -465,12 +537,18 @@ impl PlayerApp {
                 .map(|n| n.to_string_lossy().to_string())
         });
         let clock = self.player.as_ref().map(|p| p.clock());
+        let subtitle = self
+            .player
+            .as_ref()
+            .and_then(|p| p.subtitle_at(p.clock().position_secs()));
         let view = PlayerView {
             clock: clock.as_ref().map(|c| c.as_ref()),
             filename: filename.as_deref(),
             has_media: self.player.is_some(),
             drag_active: self.file_hover,
             error: self.load_error.as_deref(),
+            warning: self.load_warning.as_deref(),
+            subtitle,
         };
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {

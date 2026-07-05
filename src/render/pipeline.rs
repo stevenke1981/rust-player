@@ -48,6 +48,8 @@ impl RenderPipeline {
         }))
         .ok_or_else(|| PlayerError::Render("no GPU adapter".into()))?;
 
+        crate::hw::log_adapter_info(&adapter);
+
         let (device, queue) = pollster::block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("rust-player-device"),
