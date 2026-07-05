@@ -10,20 +10,13 @@ use rav1d::src::lib::{
 };
 
 use crate::error::{PlayerError, Result};
-use crate::video::demux::VideoPacket;
+use crate::video::demux::{VideoCodec, VideoPacket};
+pub use crate::video::frame::DecodedFrame;
+use crate::video::h264::H264Decoder;
+use crate::video::h265::H265Decoder;
 use crate::video::obu::mp4_sample_to_obu_stream;
 
-#[derive(Clone)]
-pub struct DecodedFrame {
-    pub pts_secs: f64,
-    pub width: u32,
-    pub height: u32,
-    pub y_plane: Vec<u8>,
-    pub u_plane: Vec<u8>,
-    pub v_plane: Vec<u8>,
-    pub y_stride: usize,
-    pub uv_stride: usize,
-}
+
 
 pub struct Av1Decoder {
     context: Option<Dav1dContext>,
@@ -170,8 +163,8 @@ fn extract_frame(picture: &Dav1dPicture, pts_secs: f64) -> Option<DecodedFrame> 
 
     let width = picture.p.w as u32;
     let height = picture.p.h as u32;
-    let _y_stride = picture.stride[0].unsigned_abs() as usize;
-    let _uv_stride = picture.stride[1].unsigned_abs() as usize;
+    let _y_stride = picture.stride[0].unsigned_abs();
+    let _uv_stride = picture.stride[1].unsigned_abs();
 
     let y_ptr = picture.data[0]?.as_ptr() as *const u8;
     let u_ptr = picture.data[1]?.as_ptr() as *const u8;
@@ -187,7 +180,7 @@ fn extract_frame(picture: &Dav1dPicture, pts_secs: f64) -> Option<DecodedFrame> 
 
     unsafe {
         copy_plane(y_ptr, picture.stride[0], &mut y_plane, width as usize, y_h);
-        if picture.p.layout as u32 == DAV1D_PIXEL_LAYOUT_I420 as u32 {
+        if picture.p.layout == DAV1D_PIXEL_LAYOUT_I420 {
             copy_plane(u_ptr, picture.stride[1], &mut u_plane, uv_w, uv_h);
             copy_plane(v_ptr, picture.stride[1], &mut v_plane, uv_w, uv_h);
         }
@@ -203,6 +196,41 @@ fn extract_frame(picture: &Dav1dPicture, pts_secs: f64) -> Option<DecodedFrame> 
         y_stride: width as usize,
         uv_stride: uv_w,
     })
+}
+
+pub enum VideoDecoder {
+    Av1(Av1Decoder),
+    H264(H264Decoder),
+    H265(H265Decoder),
+}
+
+impl VideoDecoder {
+    pub fn for_codec(codec: VideoCodec, extradata: &[u8]) -> Result<Self> {
+        match codec {
+            VideoCodec::Av1 => Ok(Self::Av1(Av1Decoder::new()?)),
+            VideoCodec::H264 => Ok(Self::H264(H264Decoder::new(extradata)?)),
+            VideoCodec::H265 => Ok(Self::H265(H265Decoder::new(extradata)?)),
+            VideoCodec::Unknown => Err(PlayerError::VideoDecode(
+                "unsupported video codec".into(),
+            )),
+        }
+    }
+
+    pub fn decode(&mut self, packet: &VideoPacket) -> Result<Vec<DecodedFrame>> {
+        match self {
+            Self::Av1(d) => d.decode(packet),
+            Self::H264(d) => d.decode(packet),
+            Self::H265(d) => d.decode(packet),
+        }
+    }
+
+    pub fn flush(&mut self) -> Result<Vec<DecodedFrame>> {
+        match self {
+            Self::Av1(d) => d.flush(),
+            Self::H264(d) => d.flush(),
+            Self::H265(d) => d.flush(),
+        }
+    }
 }
 
 unsafe fn copy_plane(

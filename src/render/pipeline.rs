@@ -5,6 +5,17 @@ use winit::window::Window;
 use crate::error::{PlayerError, Result};
 use crate::video::DecodedFrame;
 
+struct PlaneTextures {
+    y: wgpu::Texture,
+    u: wgpu::Texture,
+    v: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    u_view: wgpu::TextureView,
+    v_view: wgpu::TextureView,
+    width: u32,
+    height: u32,
+}
+
 pub struct RenderPipeline {
     pub(crate) surface: wgpu::Surface<'static>,
     pub(crate) device: wgpu::Device,
@@ -13,9 +24,7 @@ pub struct RenderPipeline {
     pub(crate) pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
-    y_texture: Option<wgpu::Texture>,
-    u_texture: Option<wgpu::Texture>,
-    v_texture: Option<wgpu::Texture>,
+    planes: Option<PlaneTextures>,
     pub(crate) bind_group: Option<wgpu::BindGroup>,
     current_pts: f64,
 }
@@ -164,9 +173,7 @@ impl RenderPipeline {
             pipeline,
             bind_group_layout,
             sampler,
-            y_texture: None,
-            u_texture: None,
-            v_texture: None,
+            planes: None,
             bind_group: None,
             current_pts: 0.0,
         })
@@ -183,66 +190,77 @@ impl RenderPipeline {
     pub fn upload_frame(&mut self, frame: &DecodedFrame) {
         self.current_pts = frame.pts_secs;
 
-        let y_tex = self.create_plane_texture(
-            frame.width,
-            frame.height,
-            &frame.y_plane,
-            "y_plane",
-        );
-        let u_tex = self.create_plane_texture(
-            frame.width / 2,
-            frame.height / 2,
-            &frame.u_plane,
-            "u_plane",
-        );
-        let v_tex = self.create_plane_texture(
-            frame.width / 2,
-            frame.height / 2,
-            &frame.v_plane,
-            "v_plane",
-        );
+        let uv_w = frame.width / 2;
+        let uv_h = frame.height / 2;
 
-        let y_view = y_tex.create_view(&Default::default());
-        let u_view = u_tex.create_view(&Default::default());
-        let v_view = v_tex.create_view(&Default::default());
+        let needs_recreate = self
+            .planes
+            .as_ref()
+            .is_none_or(|p| p.width != frame.width || p.height != frame.height);
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("yuv_bind_group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&y_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&u_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::TextureView(&v_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
-            ],
-        });
+        if needs_recreate {
+            let planes = self.create_plane_textures(frame.width, frame.height);
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("yuv_bind_group"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&planes.y_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&planes.u_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: wgpu::BindingResource::TextureView(&planes.v_view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    },
+                ],
+            });
+            self.planes = Some(planes);
+            self.bind_group = Some(bind_group);
+        }
 
-        self.y_texture = Some(y_tex);
-        self.u_texture = Some(u_tex);
-        self.v_texture = Some(v_tex);
-        self.bind_group = Some(bind_group);
+        let Some(planes) = &self.planes else {
+            return;
+        };
+
+        self.write_plane_data(&planes.y, frame.width, frame.height, &frame.y_plane);
+        self.write_plane_data(&planes.u, uv_w, uv_h, &frame.u_plane);
+        self.write_plane_data(&planes.v, uv_w, uv_h, &frame.v_plane);
     }
 
-    fn create_plane_texture(
-        &self,
-        width: u32,
-        height: u32,
-        data: &[u8],
-        label: &str,
-    ) -> wgpu::Texture {
-        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+    fn create_plane_textures(&self, width: u32, height: u32) -> PlaneTextures {
+        let uv_w = width / 2;
+        let uv_h = height / 2;
+
+        let y = self.alloc_plane_texture(width, height, "y_plane");
+        let u = self.alloc_plane_texture(uv_w, uv_h, "u_plane");
+        let v = self.alloc_plane_texture(uv_w, uv_h, "v_plane");
+
+        let y_view = y.create_view(&Default::default());
+        let u_view = u.create_view(&Default::default());
+        let v_view = v.create_view(&Default::default());
+
+        PlaneTextures {
+            y,
+            u,
+            v,
+            y_view,
+            u_view,
+            v_view,
+            width,
+            height,
+        }
+    }
+
+    fn alloc_plane_texture(&self, width: u32, height: u32, label: &str) -> wgpu::Texture {
+        self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some(label),
             size: wgpu::Extent3d {
                 width: width.max(1),
@@ -255,11 +273,13 @@ impl RenderPipeline {
             format: wgpu::TextureFormat::R8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
-        });
+        })
+    }
 
+    fn write_plane_data(&self, texture: &wgpu::Texture, width: u32, height: u32, data: &[u8]) {
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
-                texture: &texture,
+                texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -276,8 +296,6 @@ impl RenderPipeline {
                 depth_or_array_layers: 1,
             },
         );
-
-        texture
     }
 
     pub fn render(&mut self) -> Result<()> {

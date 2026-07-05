@@ -47,17 +47,9 @@ impl Language {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Locale {
     lang: Language,
-}
-
-impl Default for Locale {
-    fn default() -> Self {
-        Self {
-            lang: Language::default(),
-        }
-    }
 }
 
 impl Locale {

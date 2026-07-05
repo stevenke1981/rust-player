@@ -16,19 +16,24 @@ use crate::i18n::{Language, Locale};
 use crate::render::RenderPipeline;
 use crate::sync::AvSync;
 use crate::ui::{apply_theme, draw_player_ui, PlayerUiState, PlayerView};
-use crate::video::{Av1Decoder, DecodedFrame, Mp4Demuxer};
+use crate::video::{DecodedFrame, Mp4Demuxer, VideoDecoder};
 
 const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4a", "mp3"];
+
+const AUDIO_PREFILL_SAMPLES: usize = 4096;
+const MAX_VIDEO_PACKETS_PER_TICK: usize = 4;
 
 pub struct MediaPlayer {
     audio_decoder: Option<AudioDecoder>,
     video_demuxer: Option<Mp4Demuxer>,
-    video_decoder: Av1Decoder,
+    video_decoder: VideoDecoder,
     audio_output: AudioOutput,
     clock: Arc<PlaybackClock>,
     av_sync: AvSync,
     pending_audio: Vec<f32>,
     has_video: bool,
+    output_playing: bool,
+    last_volume: f32,
 }
 
 impl MediaPlayer {
@@ -53,7 +58,11 @@ impl MediaPlayer {
         }
 
         let audio_output = AudioOutput::new(sample_rate, channels, clock.clone())?;
-        let video_decoder = Av1Decoder::new()?;
+        let video_decoder = if let Some(ref demuxer) = video_demuxer {
+            VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata())?
+        } else {
+            VideoDecoder::for_codec(crate::video::VideoCodec::Av1, &[])?
+        };
         let av_sync = AvSync::new(clock.clone());
 
         Ok(Self {
@@ -65,6 +74,8 @@ impl MediaPlayer {
             av_sync,
             pending_audio: Vec::new(),
             has_video,
+            output_playing: false,
+            last_volume: 1.0,
         })
     }
 
@@ -74,28 +85,42 @@ impl MediaPlayer {
 
     pub fn tick(&mut self, playing: bool) -> Option<DecodedFrame> {
         if playing {
-            self.audio_output.resume();
+            if !self.output_playing {
+                self.audio_output.resume();
+                self.output_playing = true;
+            }
         } else {
-            self.audio_output.pause();
+            if self.output_playing {
+                self.audio_output.pause();
+                self.output_playing = false;
+            }
             return None;
         }
 
+        let channels = self.audio_output.channels() as usize;
+        let prefill_threshold = self.audio_output.sample_rate() as usize * channels / 5;
+
         if let Some(dec) = &mut self.audio_decoder {
-            if self.pending_audio.len() < self.audio_output.sample_rate() as usize * 2 {
-                if let Ok(Some(buf)) = dec.decode_next() {
-                    self.pending_audio.extend(buf.samples);
+            while self.pending_audio.len() < prefill_threshold {
+                match dec.decode_next() {
+                    Ok(Some(buf)) => self.pending_audio.extend(buf.samples),
+                    Ok(None) => break,
+                    Err(_) => break,
                 }
             }
         }
         if !self.pending_audio.is_empty() {
-            let chunk = self.pending_audio.len().min(4096);
-            let samples: Vec<f32> = self.pending_audio.drain(..chunk).collect();
-            let _ = self.audio_output.write(&samples);
+            let chunk = self.pending_audio.len().min(AUDIO_PREFILL_SAMPLES);
+            let _ = self.audio_output.write(&self.pending_audio[..chunk]);
+            self.pending_audio.drain(..chunk);
         }
 
         if self.has_video {
             if let Some(demuxer) = &mut self.video_demuxer {
-                if let Ok(Some(packet)) = demuxer.next_packet() {
+                for _ in 0..MAX_VIDEO_PACKETS_PER_TICK {
+                    let Ok(Some(packet)) = demuxer.next_packet() else {
+                        break;
+                    };
                     if let Ok(frames) = self.video_decoder.decode(&packet) {
                         for frame in frames {
                             self.av_sync.push_frame(frame);
@@ -113,7 +138,10 @@ impl MediaPlayer {
     }
 
     pub fn handle_ui(&mut self, state: &mut PlayerUiState) {
-        self.set_volume(state.volume);
+        if (state.volume - self.last_volume).abs() > f32::EPSILON {
+            self.set_volume(state.volume);
+            self.last_volume = state.volume;
+        }
         if state.stop_playback {
             let _ = self.seek(0.0);
             state.is_playing = false;
@@ -145,6 +173,8 @@ impl MediaPlayer {
         self.clock.seek(position_secs);
         if let Some(demuxer) = &mut self.video_demuxer {
             demuxer.seek(position_secs)?;
+            self.video_decoder =
+                VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata())?;
         }
         Ok(())
     }
@@ -258,7 +288,7 @@ impl PlayerApp {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| self.locale.window_title_default());
-        let _ = window.set_title(&self.locale.window_title(&name));
+        window.set_title(&self.locale.window_title(&name));
     }
 
     fn pick_file_dialog(&mut self) {
@@ -293,7 +323,7 @@ impl ApplicationHandler for PlayerApp {
             event_loop
                 .create_window(
                     Window::default_attributes()
-                        .with_title(&self.locale.window_title_default())
+                        .with_title(self.locale.window_title_default())
                         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0)),
                 )
                 .expect("create window"),
@@ -369,18 +399,22 @@ impl ApplicationHandler for PlayerApp {
                         Key::Named(NamedKey::Space) => {
                             if self.player.is_some() {
                                 self.ui_state.is_playing = !self.ui_state.is_playing;
+                                window.request_redraw();
                             }
                         }
                         Key::Named(NamedKey::ArrowLeft) => {
                             self.ui_state.skip_backward = true;
+                            window.request_redraw();
                         }
                         Key::Named(NamedKey::ArrowRight) => {
                             self.ui_state.skip_forward = true;
+                            window.request_redraw();
                         }
-                        Key::Character(ref s) if s.eq_ignore_ascii_case("o") => {
-                            if self.modifiers.state().control_key() {
-                                self.pick_file_dialog();
-                            }
+                        Key::Character(ref s)
+                            if s.eq_ignore_ascii_case("o")
+                                && self.modifiers.state().control_key() =>
+                        {
+                            self.pick_file_dialog();
                         }
                         _ => {}
                     }
@@ -400,7 +434,14 @@ impl ApplicationHandler for PlayerApp {
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
-            window.request_redraw();
+            let needs_redraw = self.ui_state.is_playing
+                || self.file_hover
+                || self.load_error.is_some()
+                || self.ui_state.seek_drag
+                || self.player.is_none();
+            if needs_redraw {
+                window.request_redraw();
+            }
         }
     }
 }
@@ -551,7 +592,7 @@ pub fn run_render_only(path: &Path) -> Result<()> {
         window: Option<Arc<Window>>,
         render: Option<RenderPipeline>,
         demuxer: Option<Mp4Demuxer>,
-        decoder: Av1Decoder,
+        decoder: VideoDecoder,
         path: PathBuf,
     }
 
@@ -571,7 +612,12 @@ pub fn run_render_only(path: &Path) -> Result<()> {
             );
             let render = RenderPipeline::new(window.clone()).expect("render");
             let demuxer = Mp4Demuxer::open(&self.path).ok();
-            let decoder = Av1Decoder::new().expect("decoder");
+            let decoder = demuxer
+                .as_ref()
+                .map(|d| VideoDecoder::for_codec(d.video_codec(), d.extradata()))
+                .transpose()
+                .expect("decoder")
+                .unwrap_or_else(|| VideoDecoder::for_codec(crate::video::VideoCodec::Av1, &[]).expect("decoder"));
             window.request_redraw();
             self.window = Some(window);
             self.render = Some(render);
@@ -601,7 +647,7 @@ pub fn run_render_only(path: &Path) -> Result<()> {
                                 if let Some(frame) = frames.last() {
                                     render.upload_frame(frame);
                                     if let Some(w) = &self.window {
-                                        let _ = w.set_title(&format!(
+                                        w.set_title(&format!(
                                             "PTS={:.3}s {}x{}",
                                             frame.pts_secs, frame.width, frame.height
                                         ));
@@ -631,7 +677,7 @@ pub fn run_render_only(path: &Path) -> Result<()> {
         window: None,
         render: None,
         demuxer: None,
-        decoder: Av1Decoder::new()?,
+        decoder: VideoDecoder::for_codec(crate::video::VideoCodec::Av1, &[])?,
         path: path.to_path_buf(),
     };
     event_loop

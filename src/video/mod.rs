@@ -1,8 +1,12 @@
 mod decoder;
 mod demux;
+mod frame;
+mod h264;
+mod h265;
+mod nal;
 mod obu;
 
-pub use decoder::{Av1Decoder, DecodedFrame};
+pub use decoder::{Av1Decoder, DecodedFrame, VideoDecoder};
 pub use demux::{Mp4Demuxer, VideoCodec, VideoPacket};
 
 use std::path::Path;
@@ -11,9 +15,7 @@ use crate::error::Result;
 
 pub fn decode_file(path: &Path, max_frames: usize) -> Result<()> {
     let mut demuxer = Mp4Demuxer::open(path)?;
-    let mut decoder = Av1Decoder::new()?;
-
-
+    let mut decoder = VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata())?;
 
     log::info!(
         "opened video: codec={:?}, samples={}",
@@ -29,7 +31,7 @@ pub fn decode_file(path: &Path, max_frames: usize) -> Result<()> {
         };
         packets_tried += 1;
 
-        if packet.data.len() < 16 {
+        if packet.data.len() < 4 {
             continue;
         }
 

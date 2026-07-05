@@ -37,13 +37,20 @@ impl RingBuffer {
 
     fn write(&mut self, samples: &[f32]) -> usize {
         let mut written = 0;
-        for &sample in samples {
-            if self.available_write() == 0 {
-                break;
-            }
-            self.data[self.write_pos] = sample;
-            self.write_pos = (self.write_pos + 1) % self.capacity;
-            written += 1;
+        let mut src_idx = 0;
+        while src_idx < samples.len() && self.available_write() > 0 {
+            let contiguous = if self.write_pos >= self.read_pos {
+                self.capacity - self.write_pos
+            } else {
+                self.read_pos - self.write_pos - 1
+            };
+            let avail = self.available_write();
+            let to_write = (samples.len() - src_idx).min(contiguous).min(avail);
+            let end = self.write_pos + to_write;
+            self.data[self.write_pos..end].copy_from_slice(&samples[src_idx..src_idx + to_write]);
+            self.write_pos = end % self.capacity;
+            src_idx += to_write;
+            written += to_write;
         }
         written
     }
@@ -90,6 +97,7 @@ impl AudioOutput {
             .map_err(|e| PlayerError::AudioOutput(e.to_string()))?;
 
         let channels_usize = channels as usize;
+        // ~500ms of interleaved samples to absorb decode jitter.
         let ring = Arc::new(Mutex::new(RingBuffer::new(
             sample_rate as usize * channels_usize / 2,
         )));
@@ -183,5 +191,35 @@ impl AudioOutput {
 
     pub fn volume(&self) -> f32 {
         self.volume.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1000.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ring_buffer_batch_write_read() {
+        let mut ring = RingBuffer::new(16);
+        let samples: Vec<f32> = (0..10).map(|i| i as f32).collect();
+        assert_eq!(ring.write(&samples), 10);
+        assert_eq!(ring.available_read(), 10);
+
+        let mut out = vec![0.0; 10];
+        assert_eq!(ring.read(&mut out, 1.0), 10);
+        assert_eq!(out, samples);
+    }
+
+    #[test]
+    fn ring_buffer_wraps_around() {
+        let mut ring = RingBuffer::new(8);
+        assert_eq!(ring.write(&[1.0, 2.0, 3.0, 4.0, 5.0]), 5);
+        let mut partial = [0.0; 3];
+        assert_eq!(ring.read(&mut partial, 1.0), 3);
+        assert_eq!(partial, [1.0, 2.0, 3.0]);
+        assert_eq!(ring.write(&[6.0, 7.0, 8.0, 9.0, 10.0]), 5);
+        let mut rest = [0.0; 7];
+        assert_eq!(ring.read(&mut rest, 1.0), 7);
+        assert_eq!(rest, [4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]);
     }
 }
