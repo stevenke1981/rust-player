@@ -1,0 +1,28 @@
+[package]
+name = "rust-player"
+version = "0.1.0"
+edition = "2021"
+description = "Native Rust media player with symphonia, rav1d, and wgpu"
+
+[dependencies]
+symphonia = { version = "0.5", features = ["all"] }
+cpal = "0.15"
+mp4 = "0.14"
+mp4parse = { version = "0.17", features = ["unstable-api"] }
+rav1d = { version = "1.1", default-features = false, features = ["bitdepth_8"] }
+wgpu = "24"
+winit = "0.30"
+pollster = "0.4"
+egui = "0.31"
+egui-wgpu = "0.31"
+egui-winit = "0.31"
+parking_lot = "0.12"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+bytemuck = { version = "1", features = ["derive"] }
+libc = "0.2"
+rfd = "0.15"
+
+[dev-dependencies]
+tempfile = "3"
