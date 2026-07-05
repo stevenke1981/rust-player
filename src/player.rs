@@ -1035,4 +1035,140 @@ mod tests {
         assert!(is_media_file(Path::new("audio.MP3")));
         assert!(!is_media_file(Path::new("readme.txt")));
     }
+
+    // ── WorkerPerFrameStatus tests ──────────────────────────────────────────
+
+    #[test]
+    fn worker_status_default_values() {
+        let s = WorkerPerFrameStatus::default();
+        assert_eq!(s.demuxed_packets, 0);
+        assert_eq!(s.decoded_frames, 0);
+        assert_eq!(s.last_frame_pts, 0.0);
+        assert!(!s.worker_running);
+    }
+
+    #[test]
+    fn worker_status_shared_arc_mutex() {
+        let status = Arc::new(Mutex::new(WorkerPerFrameStatus::default()));
+
+        // Writer: increment counters.
+        {
+            let mut s = status.lock().unwrap();
+            s.demuxed_packets = 42;
+            s.decoded_frames = 10;
+            s.last_frame_pts = 12.5;
+            s.worker_running = true;
+        }
+
+        // Reader: verify values.
+        {
+            let s = status.lock().unwrap();
+            assert_eq!(s.demuxed_packets, 42);
+            assert_eq!(s.decoded_frames, 10);
+            assert_eq!(s.last_frame_pts, 12.5);
+            assert!(s.worker_running);
+        }
+    }
+
+    #[test]
+    fn worker_status_concurrent_increment() {
+        let status = Arc::new(Mutex::new(WorkerPerFrameStatus::default()));
+        let mut handles = Vec::new();
+
+        // Simulate 4 workers each incrementing `decoded_frames` 250 times.
+        for _ in 0..4 {
+            let s = Arc::clone(&status);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..250 {
+                    let mut lock = s.lock().unwrap();
+                    lock.decoded_frames += 1;
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_s = status.lock().unwrap();
+        assert_eq!(final_s.decoded_frames, 1000);
+    }
+
+    #[test]
+    fn worker_status_clone_is_independent() {
+        let original = WorkerPerFrameStatus {
+            demuxed_packets: 100,
+            decoded_frames: 50,
+            last_frame_pts: 30.0,
+            worker_running: true,
+        };
+
+        let mut cloned = original.clone();
+        cloned.demuxed_packets = 200;
+
+        assert_eq!(original.demuxed_packets, 100);
+        assert_eq!(cloned.demuxed_packets, 200);
+        assert_eq!(cloned.decoded_frames, 50);
+    }
+
+    // ── PlaybackStatus tests ────────────────────────────────────────────────
+
+    #[test]
+    fn waiting_reason_error_extraction() {
+        let codec_err = WaitingReason::CodecUnsupported("av1".into());
+        let demux_err = WaitingReason::DemuxError("corrupt file".into());
+        let decode_err = WaitingReason::DecodeError("obu error".into());
+
+        assert_eq!(
+            extract_error(&WaitingReason::None),
+            None
+        );
+        assert_eq!(extract_error(&codec_err), Some("av1".to_string()));
+        assert_eq!(extract_error(&demux_err), Some("corrupt file".to_string()));
+        assert_eq!(extract_error(&decode_err), Some("obu error".to_string()));
+        assert_eq!(extract_error(&WaitingReason::WaitingForFirstFrame), None);
+        assert_eq!(extract_error(&WaitingReason::Decoding), None);
+        assert_eq!(extract_error(&WaitingReason::SeekPending), None);
+        assert_eq!(extract_error(&WaitingReason::NoVideoTrack), None);
+    }
+
+    /// Helper matching the extraction logic in `playback_status()`.
+    fn extract_error(reason: &WaitingReason) -> Option<String> {
+        match reason {
+            WaitingReason::CodecUnsupported(m)
+            | WaitingReason::DemuxError(m)
+            | WaitingReason::DecodeError(m) => Some(m.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn playback_status_default_values() {
+        let ps = PlaybackStatus::default();
+        assert_eq!(ps.demuxed_packets, 0);
+        assert_eq!(ps.decoded_frames, 0);
+        assert_eq!(ps.uploaded_frames, 0);
+        assert!(!ps.has_render_frame);
+        assert_eq!(ps.waiting_reason, WaitingReason::None);
+        assert!(!ps.worker_running);
+        assert!(!ps.is_seeking);
+        assert!(!ps.player_active);
+    }
+
+    #[test]
+    fn playback_status_partial_update() {
+        let mut ps = PlaybackStatus::default();
+        ps.demuxed_packets = 10;
+        ps.decoded_frames = 8;
+        ps.uploaded_frames = 7;
+        ps.has_render_frame = true;
+        ps.worker_running = true;
+        ps.waiting_reason = WaitingReason::Decoding;
+
+        assert_eq!(ps.demuxed_packets, 10);
+        assert_eq!(ps.decoded_frames, 8);
+        assert_eq!(ps.uploaded_frames, 7);
+        assert!(ps.has_render_frame);
+        assert_eq!(ps.waiting_reason, WaitingReason::Decoding);
+    }
 }
