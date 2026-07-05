@@ -5,6 +5,7 @@ use egui::{Align2, Color32, FontId, Frame, Order, RichText, Stroke};
 
 use crate::audio::PlaybackClock;
 use crate::i18n::{Language, Locale};
+use crate::player::{PlaybackStatus, WaitingReason};
 
 pub use fonts::setup_fonts;
 pub use theme::apply_theme;
@@ -45,6 +46,9 @@ pub struct PlayerView<'a> {
     pub error: Option<&'a str>,
     pub warning: Option<&'a str>,
     pub subtitle: Option<&'a str>,
+    pub playback_status: Option<&'a PlaybackStatus>,
+    pub render_has_frame: bool,
+    pub render_uploaded: u64,
 }
 
 pub fn draw_player_ui(
@@ -59,6 +63,7 @@ pub fn draw_player_ui(
     draw_subtitle_overlay(ctx, view.subtitle);
     draw_warning_toast(ctx, view.warning);
     draw_error_toast(ctx, view.error);
+    draw_status_overlay(ctx, view);
 }
 
 fn draw_language_selector(ui: &mut egui::Ui, locale: &mut Locale) {
@@ -312,6 +317,115 @@ fn draw_drop_overlay(ctx: &egui::Context, view: &PlayerView<'_>, locale: &Locale
                 subtitle,
                 FontId::proportional(13.0),
                 theme::TEXT_DIM,
+            );
+        });
+}
+
+/// Draw a diagnostic overlay when media is loaded but no video frame is visible yet.
+/// This replaces the silent black screen with informative status.
+fn draw_status_overlay(ctx: &egui::Context, view: &PlayerView<'_>) {
+    let Some(status) = &view.playback_status else {
+        return;
+    };
+
+    // Only show when media is loaded but no render frame AND not actively showing video.
+    if view.render_has_frame && status.waiting_reason == WaitingReason::None && !status.is_seeking {
+        return;
+    }
+
+    let screen = ctx.input(|i| i.screen_rect());
+
+    let (message, detail) = match &status.waiting_reason {
+        WaitingReason::None if view.render_has_frame && status.is_seeking => {
+            ("⏳ Seeking...", "Waiting for new video frame")
+        }
+        WaitingReason::None if !view.render_has_frame && status.decoded_frames > 0 => {
+            ("🎬 Frame decoded", "Rendering display...")
+        }
+        WaitingReason::None if status.worker_running && status.decoded_frames == 0 => {
+            ("⏳ Decoding", "Waiting for first video frame")
+        }
+        WaitingReason::None if !status.worker_running && status.decoded_frames == 0 => {
+            ("⚠ Worker not running", "Check codec support or file format")
+        }
+        WaitingReason::WaitingForFirstFrame => {
+            ("⏳ Waiting for first frame", "Decoder starting...")
+        }
+        WaitingReason::Decoding => {
+            ("⏳ Decoding in progress", "Video frames are being decoded")
+        }
+        WaitingReason::SeekPending => {
+            ("⏳ Seeking", "Loading new position...")
+        }
+        WaitingReason::CodecUnsupported(msg) => {
+            ("✗ Unsupported codec", msg.as_str())
+        }
+        WaitingReason::DemuxError(msg) => {
+            ("✗ Demux error", msg.as_str())
+        }
+        WaitingReason::DecodeError(msg) => {
+            ("✗ Decode error", msg.as_str())
+        }
+        WaitingReason::NoVideoTrack => {
+            ("ℹ Audio only", "No video track in this file")
+        }
+        WaitingReason::None => {
+            if view.render_has_frame {
+                ("▶ Playing", "Video frame displayed")
+            } else if status.decoded_frames > 0 {
+                ("🎬 Decoded", "Waiting for render pipeline")
+            } else {
+                ("⏳ Initializing", "Decoder starting...")
+            }
+        }
+    };
+
+    egui::Area::new(egui::Id::new("status_overlay"))
+        .order(Order::Foreground)
+        .anchor(Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
+        .show(ctx, |ui| {
+            let card_width = 360.0;
+            let card_height = 80.0;
+            let card_rect = egui::Rect::from_min_size(
+                egui::pos2(screen.center().x - card_width / 2.0, screen.center().y - card_height / 2.0 - 40.0),
+                egui::vec2(card_width, card_height),
+            );
+
+            let painter = ui.painter();
+            painter.rect_filled(card_rect, 10.0, Color32::from_black_alpha(180));
+            painter.rect_stroke(
+                card_rect,
+                10.0,
+                Stroke::new(1.0, Color32::from_rgb(100, 100, 120)),
+                egui::StrokeKind::Middle,
+            );
+
+            painter.text(
+                card_rect.center() + egui::vec2(0.0, -14.0),
+                Align2::CENTER_CENTER,
+                message,
+                FontId::proportional(18.0),
+                Color32::WHITE,
+            );
+            painter.text(
+                card_rect.center() + egui::vec2(0.0, 12.0),
+                Align2::CENTER_CENTER,
+                detail,
+                FontId::proportional(13.0),
+                Color32::from_rgb(180, 180, 190),
+            );
+
+            // Show diagnostic counters below the card.
+            let stats = format!(
+                "demux: {}  decode: {}  upload: {}",
+                status.demuxed_packets, status.decoded_frames, status.uploaded_frames,
+            );
+            painter.text(
+                egui::pos2(card_rect.center().x, card_rect.bottom() + 16.0),
+                Align2::CENTER_CENTER,
+                stats,
+                FontId::proportional(11.0),
+                Color32::from_rgb(120, 120, 130),
             );
         });
 }

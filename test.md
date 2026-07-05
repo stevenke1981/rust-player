@@ -118,3 +118,69 @@ cargo build --release
 | 整體 | T1.1, T1.2 | ⬜ |
 
 全部 ⬜ 改為 ✅ 後，更新 `final.md`。
+
+---
+
+## T7 — 黑畫面診斷與修復回歸測試（CBM 檢視後新增）
+
+### T7.1 起播首幀測試
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T7.1.1 | `cargo run --release -- assets/test_av1.mp4` | 2 秒內顯示第一個視訊幀，或 UI 顯示明確錯誤 |
+| T7.1.2 | 起播後觀察 UI overlay | 不得只剩黑畫面；若等待，顯示「等待視訊幀」與狀態資訊 |
+| T7.1.3 | 開啟 `RUST_LOG=debug` 重跑 | log 含 demux packet、decoded frame、uploaded frame 或錯誤原因 |
+
+### T7.2 Render 無 frame fallback
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T7.2.1 | 啟動播放器但不載入媒體 | 顯示開檔/拖放提示，不是純黑畫面 |
+| T7.2.2 | 載入 unsupported codec 影片 | UI 顯示不支援 codec 或 decode init failed |
+| T7.2.3 | 模擬 `RenderPipeline` 尚無 bind group | UI overlay 顯示 no frame uploaded / loading |
+
+### T7.3 Decode worker 狀態
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T7.3.1 | 播放 AV1 MP4 | `decoded_frames > 0`、`uploaded_frames > 0` |
+| T7.3.2 | 播放無視訊軌音訊檔 | 顯示 audio-only 狀態，不報黑畫面錯誤 |
+| T7.3.3 | 播放破損 MP4 | 顯示 demux/decode error，程式不 panic |
+
+### T7.4 單元測試建議
+
+| ID | 測試名稱 | 預期 |
+|----|----------|------|
+| T7.U1 | `render_state_starts_without_frame` | 新 render pipeline 狀態 `has_frame == false` |
+| T7.U2 | `render_state_counts_uploaded_frames` | `upload_frame()` 後 frame count 增加 |
+| T7.U3 | `frame_validation_rejects_bad_plane_sizes` | plane 長度錯誤回傳錯誤，不上傳 |
+| T7.U4 | `worker_reports_decode_error` | worker status 可記錄錯誤 |
+
+---
+
+## T8 — 首幀 / seek bootstrap 回歸測試
+
+| ID | 步驟 | 預期結果 |
+|----|------|----------|
+| T8.1 | `cargo run --release -- assets/test_av1.mp4` 後立即暫停 | 畫面保留已顯示幀，非黑畫面 |
+| T8.2 | 播放中拖曳進度條至 50% | seek 後 2 秒內顯示新位置幀或 loading overlay |
+| T8.3 | 連續按 → 快轉 5 次 | 不永久黑畫面；狀態最終恢復 playing |
+| T8.4 | video-only MP4 | wall-clock/virtual audio clock 驅動畫面更新 |
+| T8.5 | H.264 MP4（實驗） | 成功播放或顯示明確 H.264 decode error |
+
+### T8 單元測試建議
+
+| ID | 測試名稱 | 預期 |
+|----|----------|------|
+| T8.U1 | `sync_bootstrap_displays_first_frame` | audio clock 起點附近第一幀可輸出 |
+| T8.U2 | `sync_seek_keeps_last_frame_until_new_ready` | seek 後新幀未到前不清成黑畫面 |
+| T8.U3 | `sync_does_not_wait_forever_for_early_frame` | early frame 等待有可診斷狀態 |
+
+---
+
+## 新增驗收判定（Phase 6/7）
+
+| Phase | 必要通過項 | 狀態 |
+|-------|------------|------|
+| Phase 6 黑畫面修復 | T7.1–T7.3、T8.1–T8.4、T7.U/T8.U 核心單元測試 | ⬜ |
+| Phase 7 架構效能 | `cargo test`、手動 smoke、無明顯回歸 | ⬜ |

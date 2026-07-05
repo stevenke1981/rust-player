@@ -27,6 +27,9 @@ pub struct RenderPipeline {
     planes: Option<PlaneTextures>,
     pub(crate) bind_group: Option<wgpu::BindGroup>,
     current_pts: f64,
+    /// Diagnostic counters.
+    uploaded_frame_count: u64,
+    surface_error_count: u64,
 }
 
 impl RenderPipeline {
@@ -178,6 +181,8 @@ impl RenderPipeline {
             planes: None,
             bind_group: None,
             current_pts: 0.0,
+            uploaded_frame_count: 0,
+            surface_error_count: 0,
         })
     }
 
@@ -192,8 +197,39 @@ impl RenderPipeline {
     pub fn upload_frame(&mut self, frame: &DecodedFrame) {
         self.current_pts = frame.pts_secs;
 
-        let uv_w = frame.width / 2;
-        let uv_h = frame.height / 2;
+        let uv_w = frame.width.div_ceil(2);
+        let uv_h = frame.height.div_ceil(2);
+
+        let w = frame.width as usize;
+        let h = frame.height as usize;
+        let uw = uv_w as usize;
+        let uh = uv_h as usize;
+
+        // Validate plane sizes before uploading.
+        if frame.y_plane.len() < w * h {
+            log::warn!(
+                "frame validation: y_plane too small ({} < {})",
+                frame.y_plane.len(),
+                w * h
+            );
+            return;
+        }
+        if frame.u_plane.len() < uw * uh {
+            log::warn!(
+                "frame validation: u_plane too small ({} < {})",
+                frame.u_plane.len(),
+                uw * uh
+            );
+            return;
+        }
+        if frame.v_plane.len() < uw * uh {
+            log::warn!(
+                "frame validation: v_plane too small ({} < {})",
+                frame.v_plane.len(),
+                uw * uh
+            );
+            return;
+        }
 
         let needs_recreate = self
             .planes
@@ -235,6 +271,8 @@ impl RenderPipeline {
         self.write_plane_data(&planes.y, frame.width, frame.height, &frame.y_plane);
         self.write_plane_data(&planes.u, uv_w, uv_h, &frame.u_plane);
         self.write_plane_data(&planes.v, uv_w, uv_h, &frame.v_plane);
+
+        self.uploaded_frame_count += 1;
     }
 
     fn create_plane_textures(&self, width: u32, height: u32) -> PlaneTextures {
@@ -341,6 +379,26 @@ impl RenderPipeline {
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
         Ok(())
+    }
+
+    /// Returns true if at least one video frame has been uploaded.
+    pub fn has_frame(&self) -> bool {
+        self.bind_group.is_some()
+    }
+
+    /// Total number of frames successfully uploaded.
+    pub fn uploaded_frame_count(&self) -> u64 {
+        self.uploaded_frame_count
+    }
+
+    /// Total number of surface errors encountered.
+    pub fn surface_error_count(&self) -> u64 {
+        self.surface_error_count
+    }
+
+    /// Reconfigure the surface after it was lost (called by the player on SurfaceError::Lost).
+    pub fn reconfigure_surface(&mut self) {
+        self.surface.configure(&self.device, &self.config);
     }
 
     pub fn current_pts(&self) -> f64 {

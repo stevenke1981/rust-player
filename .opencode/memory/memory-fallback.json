@@ -1,0 +1,18 @@
+[
+  {
+    "id": "mr7tfdwb-2c98d2",
+    "type": "research",
+    "title": "rust-player 黑畫面根因與 CBM 檢視結論",
+    "problem": "rust-player 播放影片時出現黑畫面，需 CBM 檢視並提出優化寫入文件",
+    "context": "D:\\rust-player 純 Rust 播放器 (symphonia/rav1d/wgpu/egui)。關鍵檔：src/player.rs, render/pipeline.rs, video/worker.rs, sync/mod.rs",
+    "solution": "CBM 索引 cbm+rust-player(38 files/319 sym)。黑畫面可能根因：1) render pass 無 bind_group 時 clear BLACK 且首幀未上傳；2) AvSync 對 early frame 回 None 導致起播/seek 等待；3) worker demux/decode 錯誤只寫 log 未回 UI；4) upload_frame 無 plane 尺寸驗證；5) redraw 用 expect(surface texture) 未處理 Lost/Outdated。建議：status channel+UI overlay、startup/seek bootstrap、render has_frame()、frame validation、surface error handling、拆分 player.rs、DecodedFrame 改 Arc。",
+    "evidence": "已將改善寫入 spec.md 第9節、plan.md Phase6/7、todos.md、test.md T7/T8、final.md 檢視報告；git status 顯示 5 檔 M。尚未改 Rust 原始碼，黑畫面未修復。",
+    "tags": "rust,video,wgpu,rav1d,cbm,black-screen",
+    "source": "",
+    "status": "partial",
+    "session_id": "ses_0cd97e660ffesnJpMhU87xcijS",
+    "agent": "odin",
+    "created_at": "2026-07-05T13:17:03.131Z",
+    "updated_at": "2026-07-05T13:17:03.131Z"
+  }
+]

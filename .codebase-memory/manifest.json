@@ -1,0 +1,10 @@
+{
+  "bytes_compressed": 165260,
+  "bytes_raw": 802816,
+  "exported_at": 1783257141,
+  "files": 38,
+  "format": "sqlite-zstd",
+  "project": "cbm+rust-player",
+  "symbols": 410,
+  "version": "0.1.0"
+}

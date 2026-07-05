@@ -158,3 +158,88 @@ rust-player/
 | 6 | H.264/H.265 解碼支援 |
 | 7 | 多執行緒解碼與 1080p 效能優化 |
 | 8 | 硬體加速、字幕、串流 |
+
+---
+
+## CBM 專案檢視與優化改善計畫（2026-07-05）
+
+### 範圍與完成定義
+
+**目標**：依據 CBM 對 `rust-player` 的索引與本地源碼檢視，優先改善目前播放影片黑畫面問題，並規劃可驗證的品質、架構、效能與測試優化。
+
+**不在本輪直接變更範圍**：不新增外部大型媒體框架、不重寫播放器、不刪除既有功能、不變更使用者資料或 Git 歷史。
+
+**完成定義**：
+
+1. 黑畫面問題可被定位：UI 或 log 可指出是未收到 frame、解碼失敗、sync 等待、surface error 或 unsupported codec。
+2. 常見 AV1 MP4 測試檔起播 2 秒內顯示第一幀，否則顯示可讀錯誤。
+3. seek 後不永久黑畫面；新幀未 ready 前保留上一幀或 loading overlay。
+4. 新增/更新單元測試與手動 GUI 驗收步驟。
+
+### CBM 發現摘要
+
+| 發現 | 證據 | 風險 |
+|------|------|------|
+| `src/player.rs` 是最高熱點 | CBM query：40 個 function/class symbols | App lifecycle、render、UI、player state 混在同檔，維護風險高 |
+| render 無 frame 時清黑 | `RenderPipeline::render()` 與 `PlayerApp::redraw()` clear BLACK，只有 `bind_group` 時 draw | 解碼尚未出幀或錯誤被吞時，使用者只看到黑畫面 |
+| `MediaPlayer::tick()` 可能 clone 大型 frame | `last_video_frame: Option<DecodedFrame>` 並 clone | 4K/高 fps 下 CPU/記憶體壓力高 |
+| worker 錯誤多在 log | `video/worker.rs` demux/decode 錯誤未回傳 UI | 黑畫面不可診斷 |
+| codec 支援文件落差 | 文件說 H.264/H.265 非目標，但程式有 h264/h265 decoder | 驗收與使用者預期不一致 |
+| audio output 只支援 F32 output format | `AudioOutput::new()` 對非 F32 回 `unsupported sample format` | 部分 Windows 音訊裝置可能進 virtual sink，影響 A/V clock 行為 |
+
+### Phase 6 — 黑畫面修復（最高優先）
+
+1. **建立 playback/render 診斷狀態**
+   - 新增 `VideoPlaybackStatus`：`demux_packets`、`decoded_frames`、`uploaded_frames`、`last_frame_pts`、`last_error`、`waiting_reason`。
+   - `VideoDecodeWorker` 透過 status channel 回報 demux/decode/init/seek 狀態。
+   - UI 顯示「載入中 / 等待首幀 / 解碼失敗 / 不支援 codec」。
+
+2. **修正首幀與 seek bootstrap**
+   - 起播時：收到第一幀立即可顯示，不因 audio clock 起始誤差永久等待。
+   - seek 時：清空 queue 後保留上一幀直到新幀 ready，或顯示 semi-transparent loading overlay。
+   - `AvSync` 增加 `pop_frame_for_display_with_policy(Startup|Normal|Seeking)` 或簡化為 `allow_bootstrap_frame`。
+
+3. **Render 層避免靜默黑畫面**
+   - `RenderPipeline` 增加 `has_frame()`、`uploaded_frame_count()`。
+   - render/composite pass 若無 frame，UI 必須覆蓋提示。
+   - `get_current_texture()` 不再 `expect("surface texture")`，改為處理 `Lost/Outdated/Timeout/OutOfMemory`。
+
+4. **Frame validation**
+   - 上傳前驗證 plane 長度與 UV 尺寸，錯誤時阻止上傳並回報 UI。
+   - 支援奇數寬高時使用 `(width + 1) / 2`、`(height + 1) / 2` 的 UV 尺寸策略。
+
+5. **優先驗證素材**
+   - AV1 MP4（既有主路徑）
+   - H.264 MP4（實驗路徑）
+   - video-only MP4（virtual audio clock）
+   - 有音訊但無可解碼視訊 / unsupported codec（錯誤可見）
+
+### Phase 7 — 架構與效能改善
+
+1. 拆分 `src/player.rs`
+   - `player/app.rs`：winit lifecycle
+   - `player/compositor.rs`：video pass + egui pass
+   - `player/media.rs`：`MediaPlayer` 狀態與控制
+   - `player/status.rs`：診斷資料模型
+2. 減少 frame clone
+   - `DecodedFrame` 改為 `Arc<DecodedFrame>` 或 frame buffer handle。
+   - `AvSync` queue 與 `last_video_frame` 儲存共享指標。
+3. audio output sample format 支援
+   - 支援 I16/U16 output format 或用 cpal conversion，降低 virtual sink fallback 機率。
+4. 色彩與尺寸策略
+   - 根據 codec metadata 選 BT.601/BT.709，加入 limited/full range 設定。
+   - render shader 增加 uniform color matrix。
+5. 測試與 CI
+   - `cargo test` 必跑。
+   - 若有測試素材，加入 `decode --frames 1` 與 `--no-ui` smoke test。
+
+### 建議實作順序
+
+| 順序 | 任務 | 驗收 |
+|------|------|------|
+| 1 | 加入 status model 與 UI overlay | 黑畫面時顯示等待/錯誤原因 |
+| 2 | 修正 sync startup/seek bootstrap | 起播/seek 不永久等待早期幀 |
+| 3 | Render `has_frame` 與 surface error handling | 無 frame 不再靜默黑畫面；surface lost 可恢復 |
+| 4 | Frame validation + 奇數尺寸 | plane mismatch 有明確錯誤 |
+| 5 | 補測試與文件 | `cargo test` 通過，test.md T7/T8 可執行 |
+| 6 | 拆分 `player.rs` 與減少 frame clone | 無行為回歸，效能風險降低 |

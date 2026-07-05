@@ -93,3 +93,112 @@ cargo run --release -- assets/test_av1.mp4 --no-ui
 |------|------|
 | 2026-07-05 | Phase 5：快捷鍵、音量、T6 壓力測試 |
 | 2026-07-05 | 建立 plan/spec/todos/test/final，完成四階段實作與 Phase 1–3 自動驗收 |
+
+---
+
+## CBM 檢視報告與改善建議（2026-07-05）
+
+### 檢視方式
+
+- 使用 cbm 建立/更新索引：`cbm+rust-player`
+- 索引結果：38 files、319 symbols、878 edges
+- 主要檢視檔案：
+  - `src/player.rs`
+  - `src/render/pipeline.rs`
+  - `src/video/worker.rs`
+  - `src/video/decoder.rs`
+  - `src/video/demux.rs`
+  - `src/sync/mod.rs`
+  - `src/audio/output.rs`
+  - `src/audio/sink.rs`
+
+### 關鍵發現
+
+1. **目前播放影片黑畫面已納入最高優先改善項**
+   - render pass 在沒有 `bind_group` / 尚未上傳任何 frame 時會清成黑色。
+   - `PlayerApp::redraw()` 只有 `player.tick()` 回傳 frame 時才 `upload_frame()`。
+   - 若 decode worker 尚未產生 frame、sync 判斷 frame 太早、decode error 被吞掉，使用者看到的結果都是黑畫面。
+
+2. **錯誤可觀測性不足**
+   - `video/worker.rs` 將部分 demux/decode 問題寫到 log，但沒有傳回 UI。
+   - `player.rs` 的 UI 目前較適合顯示開檔錯誤，尚不足以顯示「等待首幀 / decoded=0 / uploaded=0 / codec unsupported」。
+
+3. **文件與實作支援格式不一致**
+   - 早期 spec 寫 H.264/H.265 非目標。
+   - 實作已有 `video/h264.rs`、`video/h265.rs`、`VideoDecoder::{Av1,H264,H265}`。
+   - 建議文件改列 H.264/H.265 為實驗支援，並加入測試與錯誤回報。
+
+4. **架構熱點集中**
+   - CBM query 顯示 `src/player.rs` symbols 最多，負責 winit lifecycle、UI、render pass、media state、檔案載入與事件處理。
+   - 建議後續拆分以降低維護成本。
+
+5. **效能改善點**
+   - `MediaPlayer::tick()` 與 `last_video_frame` 會 clone `DecodedFrame`，大型 YUV frame 成本高。
+   - 建議改 `Arc<DecodedFrame>` 或 frame handle。
+
+### 黑畫面可能根因清單
+
+| 可能根因 | 證據 | 改善方向 |
+|----------|------|----------|
+| 尚未收到首幀就 render | `RenderPipeline` 初始 `bind_group: None`，render clear BLACK | UI 顯示 loading/no frame，首幀 bootstrap |
+| sync 等待 early frame | `AvSync::pop_frame_for_display()` early frame 回 `None` | startup/seek bootstrap policy |
+| decode worker 錯誤未回 UI | worker log error 後 return/continue | status channel + UI error overlay |
+| frame plane 尺寸不符 | upload 直接依 width/height 寫 texture | upload 前 frame validation |
+| surface texture error panic/中斷 | `PlayerApp::redraw()` 使用 `expect("surface texture")` | 處理 Lost/Outdated/Timeout/OutOfMemory |
+| codec 路徑未完整驗收 | H.264/H.265 實作與文件落差 | 標示實驗、補素材與錯誤測試 |
+
+### 已寫入的改善文件
+
+- `spec.md`：新增第 9 節「CBM 檢視後新增規格 — 黑畫面修復與品質強化」
+- `plan.md`：新增「CBM 專案檢視與優化改善計畫」與 Phase 6/7 實作順序
+- `todos.md`：新增 Phase 6 黑畫面修復、Phase 7 架構效能、測試與文件任務
+- `test.md`：新增 T7 黑畫面診斷與 T8 首幀/seek bootstrap 回歸測試
+- `final.md`：新增本檢視報告
+
+### 建議下一步
+
+1. 先做 Phase 6A/6B：status channel + 首幀/seek bootstrap，因為這會直接讓黑畫面變成可診斷問題。
+2. 接著做 Phase 6C：render `has_frame()` 與 surface error handling，消除靜默黑畫面與 `expect` 風險。
+3. 再做 Phase 6D/T7/T8：frame validation 與回歸測試。
+4. 最後做 Phase 7：拆分 `player.rs`、降低 frame clone、擴充 audio sample format。
+
+### 驗證狀態
+
+Phase 6（黑畫面修復）與 Phase 7（Arc 框架構改善）已實作並通過建置與測試驗證。
+
+### 實作摘要
+
+| 類別 | 變更 | 檔案 |
+|------|------|------|
+| Status 型別 | 新增 `PlaybackStatus`、`WaitingReason`、`WorkerPerFrameStatus` | `src/player.rs` |
+| Worker 狀態 | worker 透過 `Arc<Mutex<WorkerPerFrameStatus>>` 回報 demux/decode 計數 | `src/video/worker.rs` |
+| Sync bootstrap | startup/seeking 模式，首幀立即輸出 | `src/sync/mod.rs` |
+| Render 診斷 | `has_frame()`、`uploaded_frame_count()`、surface error handling | `src/render/pipeline.rs` |
+| Frame 驗證 | upload 前檢查 plane 長度、奇數尺寸用 `div_ceil` | `src/render/pipeline.rs` |
+| Surface 錯誤 | `get_current_texture()` 改用 match，支援 Lost/Outdated 自動 reconfigure | `src/player.rs` |
+| Arc frame | `last_video_frame` 與 `tick()` 回傳型別改為 `Arc<DecodedFrame>` | `src/player.rs` |
+| UI 診斷 overlay | 顯示等待/解碼/錯誤訊息與 demux/decode/upload 計數 | `src/ui/mod.rs` |
+| 單元測試 | 新增 seeking bootstrap、startup bootstrap only once | `src/sync/mod.rs` |
+
+### 驗證結果
+
+| 項目 | 結果 |
+|------|------|
+| `cargo build` | ✅ 零 error |
+| `cargo test` | ✅ 35/35 passed（含 2 個新增 sync bootstrap 測試） |
+| `cargo clippy -- -D warnings` | ✅ 零 warning |
+
+### 剩餘風險
+
+1. **無測試媒體素材**：`assets/` 目錄未提供 AV1/H.264 MP4 測試檔，無法執行 hand GUI 驗收（T4/T5/T7/T8 需手動操作）。
+2. **黑畫面問題仍可能存在實際解碼路徑**：本實作讓黑畫面變成可診斷（UI 顯示等待/錯誤/計數），而非完全靜默。若 decoder 初始化失敗、demux 未回傳 packet、或 rav1d 內部因 OEM OBU 資料返回錯誤，UI 會顯示對應狀態而非純黑畫面。
+3. **`run_render_only` 未套用 surface error 處理**：該簡易除錯路徑仍使用 `let _ = render.render();`，在 surface lost 時會 panic。
+4. **缺少 frame validation 與 worker status 的專屬單元測試**：需要準備測試素材才能驗證實際 plane 長度檢測邏輯。
+
+### 建議下一步
+
+1. 準備測試媒體（AV1 MP4/H.264 MP4/video-only MP4）至 `assets/` 目錄
+2. 執行手動 GUI 驗收 T4/T5/T7/T8
+3. 補 `upload_frame` validation 與 worker status 單元測試
+4. 為 `run_render_only` 加上 surface error handling
+5. 考慮拆分 `src/player.rs`（phase 7 架構項目）和擴充 audio sample format 支援

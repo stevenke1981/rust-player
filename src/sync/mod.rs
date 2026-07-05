@@ -12,6 +12,10 @@ pub struct AvSync {
     pub dropped_late: u64,
     pub dropped_overflow: u64,
     pub waited_early: u64,
+    /// When true, the first eligible frame is shown immediately (seek bootstrap).
+    seeking: bool,
+    /// When true and queue is non-empty, show the first frame (startup bootstrap).
+    startup_bootstrap: bool,
 }
 
 impl AvSync {
@@ -24,6 +28,8 @@ impl AvSync {
             dropped_late: 0,
             dropped_overflow: 0,
             waited_early: 0,
+            seeking: false,
+            startup_bootstrap: true,
         }
     }
 
@@ -44,6 +50,20 @@ impl AvSync {
     pub fn pop_frame_for_display(&mut self) -> Option<DecodedFrame> {
         if self.frame_queue.is_empty() {
             return None;
+        }
+
+        // --- Bootstrap mode (startup) ---
+        // Show the first queued frame immediately to avoid initial black screen.
+        if self.startup_bootstrap {
+            self.startup_bootstrap = false;
+            return self.frame_queue.pop_front();
+        }
+
+        // --- Seeking mode ---
+        // Show the first queued frame immediately, then return to normal sync.
+        if self.seeking {
+            self.seeking = false;
+            return self.frame_queue.pop_front();
         }
 
         let audio_pts = self.clock.position_secs();
@@ -89,6 +109,21 @@ impl AvSync {
         self.frame_queue.clear();
     }
 
+    /// Reset startup bootstrap flag (used when loading new media).
+    pub fn reset_startup(&mut self) {
+        self.startup_bootstrap = true;
+        self.seeking = false;
+    }
+
+    /// Mark that a seek is in progress — next pop will return the first frame immediately.
+    pub fn set_seeking(&mut self, seeking: bool) {
+        self.seeking = seeking;
+    }
+
+    pub fn is_seeking(&self) -> bool {
+        self.seeking
+    }
+
     pub fn queue_len(&self) -> usize {
         self.frame_queue.len()
     }
@@ -109,10 +144,17 @@ mod tests {
         assert_eq!(sync.queue_len(), 2);
     }
 
+    /// Helper to create a sync instance with startup bootstrap already satisfied.
+    fn sync_no_bootstrap(clock: Arc<PlaybackClock>) -> AvSync {
+        let mut sync = AvSync::new(clock);
+        sync.startup_bootstrap = false;
+        sync
+    }
+
     #[test]
     fn sync_waits_early_frame() {
         let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
-        let mut sync = AvSync::new(clock);
+        let mut sync = sync_no_bootstrap(clock);
 
         sync.push_frame(make_frame(5.0));
         assert!(sync.pop_frame_for_display().is_none());
@@ -133,7 +175,7 @@ mod tests {
     fn sync_catches_up_when_video_lags() {
         let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
         clock.seek(2.0);
-        let mut sync = AvSync::new(clock);
+        let mut sync = sync_no_bootstrap(clock);
 
         sync.push_frame(make_frame(0.0));
         sync.push_frame(make_frame(0.5));
@@ -145,13 +187,37 @@ mod tests {
     #[test]
     fn sync_queue_overflow() {
         let clock = Arc::new(PlaybackClock::new(48_000, Some(100.0)));
-        let mut sync = AvSync::new(clock).with_threshold(1000.0);
+        let mut sync = sync_no_bootstrap(clock).with_threshold(1000.0);
         sync.max_queue_frames = 2;
 
         sync.push_frame(make_frame(0.0));
         sync.push_frame(make_frame(0.1));
         sync.push_frame(make_frame(0.2));
         assert_eq!(sync.dropped_overflow, 1);
+    }
+
+    #[test]
+    fn sync_seeking_bootstrap_returns_immediately() {
+        let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
+        let mut sync = sync_no_bootstrap(clock);
+        sync.set_seeking(true);
+
+        sync.push_frame(make_frame(3.0));
+        let frame = sync.pop_frame_for_display().expect("seek bootstrap");
+        assert!((frame.pts_secs - 3.0).abs() < 1e-6);
+        assert!(!sync.is_seeking(), "seeking should be cleared after pop");
+    }
+
+    #[test]
+    fn sync_startup_bootstrap_works_only_once() {
+        let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
+        let mut sync = AvSync::new(clock);
+
+        sync.push_frame(make_frame(0.0));
+        let _first = sync.pop_frame_for_display().expect("first frame");
+        // Second call should not have startup_bootstrap; clock at 0, next frame at 10s should wait.
+        sync.push_frame(make_frame(10.0));
+        assert!(sync.pop_frame_for_display().is_none(), "second frame should wait");
     }
 
     fn make_frame(pts: f64) -> DecodedFrame {

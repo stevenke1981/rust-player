@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use egui_wgpu::Renderer as EguiRenderer;
@@ -24,6 +25,60 @@ const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4a", "mp3", "ts"];
 
 const AUDIO_PREFILL_SAMPLES: usize = 4096;
 
+/// Per-frame diagnostic status shared between the decode worker and the player.
+#[derive(Clone, Debug, Default)]
+pub struct WorkerPerFrameStatus {
+    pub demuxed_packets: u64,
+    pub decoded_frames: u64,
+    pub last_frame_pts: f64,
+    pub worker_running: bool,
+}
+
+/// Aggregate playback status for UI consumption.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub enum WaitingReason {
+    #[default]
+    None,
+    WaitingForFirstFrame,
+    Decoding,
+    SeekPending,
+    CodecUnsupported(String),
+    DemuxError(String),
+    DecodeError(String),
+    NoVideoTrack,
+}
+
+#[derive(Clone, Debug)]
+pub struct PlaybackStatus {
+    pub demuxed_packets: u64,
+    pub decoded_frames: u64,
+    pub uploaded_frames: u64,
+    pub last_frame_pts: f64,
+    pub last_error: Option<String>,
+    pub has_render_frame: bool,
+    pub waiting_reason: WaitingReason,
+    pub worker_running: bool,
+    pub is_seeking: bool,
+    pub player_active: bool,
+}
+
+impl Default for PlaybackStatus {
+    fn default() -> Self {
+        Self {
+            demuxed_packets: 0,
+            decoded_frames: 0,
+            uploaded_frames: 0,
+            last_frame_pts: 0.0,
+            last_error: None,
+            has_render_frame: false,
+            waiting_reason: WaitingReason::None,
+            worker_running: false,
+            is_seeking: false,
+            player_active: false,
+        }
+    }
+}
+
 pub struct MediaPlayer {
     audio_decoder: Option<AudioDecoder>,
     video_worker: Option<VideoDecodeWorker>,
@@ -37,7 +92,13 @@ pub struct MediaPlayer {
     wall_clock_drive: bool,
     wall_anchor_secs: f64,
     wall_anchor_time: Option<Instant>,
-    last_video_frame: Option<DecodedFrame>,
+    last_video_frame: Option<Arc<DecodedFrame>>,
+    /// Shared status from the decode worker thread.
+    worker_status: Arc<Mutex<WorkerPerFrameStatus>>,
+    /// Track upload count for the UI.
+    uploaded_frames: Arc<AtomicU64>,
+    /// Accumulated errors or waiting reason.
+    waiting_reason: WaitingReason,
 }
 
 impl MediaPlayer {
@@ -81,6 +142,11 @@ impl MediaPlayer {
         let wall_clock_drive =
             audio_sink.is_virtual() || (audio_decoder.is_none() && has_video);
 
+        let worker_status = video_worker
+            .as_ref()
+            .map(|w| w.status_handle())
+            .unwrap_or_default();
+
         Ok(Self {
             audio_decoder,
             video_worker,
@@ -95,6 +161,9 @@ impl MediaPlayer {
             wall_anchor_secs: 0.0,
             wall_anchor_time: None,
             last_video_frame: None,
+            worker_status,
+            uploaded_frames: Arc::new(AtomicU64::new(0)),
+            waiting_reason: WaitingReason::WaitingForFirstFrame,
         })
     }
 
@@ -132,7 +201,7 @@ impl MediaPlayer {
         self.clock.clone()
     }
 
-    pub fn tick(&mut self, playing: bool) -> Option<DecodedFrame> {
+    pub fn tick(&mut self, playing: bool) -> Option<Arc<DecodedFrame>> {
         if playing {
             if !self.output_playing {
                 self.audio_sink.resume();
@@ -176,13 +245,57 @@ impl MediaPlayer {
 
         if let Some(worker) = &self.video_worker {
             worker.poll_frames(&mut self.av_sync);
+            // Read worker diagnostic counters
+            if let Ok(s) = self.worker_status.lock() {
+                if s.worker_running && s.decoded_frames == 0 && self.clock.position_secs() > 1.0 {
+                    self.waiting_reason = WaitingReason::Decoding;
+                }
+            }
         }
 
         if let Some(frame) = self.av_sync.pop_frame_for_display() {
+            let frame = Arc::new(frame);
             self.last_video_frame = Some(frame.clone());
+            self.waiting_reason = WaitingReason::None;
             Some(frame)
         } else {
+            if self.waiting_reason == WaitingReason::None
+                && self.video_worker.is_some()
+                && self.last_video_frame.is_none()
+            {
+                self.waiting_reason = WaitingReason::WaitingForFirstFrame;
+            }
             self.last_video_frame.clone()
+        }
+    }
+
+    /// Returns the aggregate playback status for UI.
+    pub fn playback_status(&self) -> PlaybackStatus {
+        let (worker_demuxed, worker_decoded, worker_pts, worker_running) = self
+            .worker_status
+            .lock()
+            .map(|s| (s.demuxed_packets, s.decoded_frames, s.last_frame_pts, s.worker_running))
+            .unwrap_or((0, 0, 0.0, false));
+
+        let has_render = self.last_video_frame.is_some();
+        let uploaded = self.uploaded_frames.load(Ordering::Relaxed);
+
+        PlaybackStatus {
+            demuxed_packets: worker_demuxed,
+            decoded_frames: worker_decoded,
+            uploaded_frames: uploaded,
+            last_frame_pts: worker_pts,
+            last_error: match &self.waiting_reason {
+                WaitingReason::CodecUnsupported(m) => Some(m.clone()),
+                WaitingReason::DemuxError(m) => Some(m.clone()),
+                WaitingReason::DecodeError(m) => Some(m.clone()),
+                _ => None,
+            },
+            has_render_frame: has_render,
+            waiting_reason: self.waiting_reason.clone(),
+            worker_running,
+            is_seeking: self.av_sync.is_seeking(),
+            player_active: self.output_playing,
         }
     }
 
@@ -220,7 +333,7 @@ impl MediaPlayer {
         self.audio_sink.clear();
         self.pending_audio.clear();
         self.av_sync.clear();
-        self.last_video_frame = None;
+        // Do NOT clear last_video_frame — keep it displayed until new frames arrive.
         if let Some(dec) = &mut self.audio_decoder {
             dec.seek(position_secs)?;
         }
@@ -234,6 +347,8 @@ impl MediaPlayer {
         if let Some(worker) = &self.video_worker {
             worker.seek(position_secs);
         }
+        self.av_sync.set_seeking(true);
+        self.waiting_reason = WaitingReason::SeekPending;
         Ok(())
     }
 
@@ -559,6 +674,7 @@ impl PlayerApp {
                 player.handle_ui(&mut self.ui_state);
                 if let Some(frame) = player.tick(self.ui_state.is_playing) {
                     render.upload_frame(&frame);
+                    player.uploaded_frames.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
@@ -578,6 +694,10 @@ impl PlayerApp {
             .player
             .as_ref()
             .and_then(|p| p.subtitle_at(p.clock().position_secs()));
+        let playback_status = self
+            .player
+            .as_ref()
+            .map(|p| p.playback_status());
         let view = PlayerView {
             clock: clock.as_ref().map(|c| c.as_ref()),
             filename: filename.as_deref(),
@@ -586,6 +706,9 @@ impl PlayerApp {
             error: self.load_error.as_deref(),
             warning: self.load_warning.as_deref(),
             subtitle,
+            playback_status: playback_status.as_ref(),
+            render_has_frame: self.render.as_ref().map(|r| r.has_frame()).unwrap_or(false),
+            render_uploaded: self.render.as_ref().map(|r| r.uploaded_frame_count()).unwrap_or(0),
         };
 
         let full_output = self.egui_ctx.run(raw_input, |ctx| {
@@ -609,10 +732,26 @@ impl PlayerApp {
         let render = self.render.as_mut().unwrap();
         let egui_renderer = self.egui_renderer.as_mut().unwrap();
 
-        let output = render
-            .surface
-            .get_current_texture()
-            .expect("surface texture");
+        // Handle surface errors gracefully — don't panic on Lost/Outdated.
+        let output = match render.surface.get_current_texture() {
+            Ok(t) => t,
+            Err(wgpu::SurfaceError::Lost) => {
+                log::warn!("surface lost, reconfiguring");
+                render.reconfigure_surface();
+                window.request_redraw();
+                return;
+            }
+            Err(wgpu::SurfaceError::Outdated) => {
+                log::debug!("surface outdated, skipping frame");
+                window.request_redraw();
+                return;
+            }
+            Err(e) => {
+                log::error!("surface error: {e}");
+                window.request_redraw();
+                return;
+            }
+        };
         let view = output
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());

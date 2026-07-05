@@ -324,3 +324,57 @@ cargo run --release -- test_av1.mp4
 ```
 
 **系統需求**：Windows 10+、支援 Vulkan/DX12/Metal 的 GPU。
+
+---
+
+## 9. CBM 檢視後新增規格 — 黑畫面修復與品質強化（2026-07-05）
+
+### 9.1 CBM 索引摘要
+
+- 專案：`cbm+rust-player`
+- 索引結果：38 files、319 symbols、878 edges
+- 主要模組熱點：`src/player.rs`、`src/video/demux.rs`、`src/audio/output.rs`、`src/video/decoder.rs`、`src/render/pipeline.rs`、`src/video/worker.rs`
+- 觀察：目前播放路徑已具備 demux、decode worker、A/V sync、wgpu render、egui overlay，但播放狀態、首幀、解碼錯誤與 render fallback 的可觀測性不足。
+
+### 9.2 目前播放影片黑畫面問題規格
+
+**現象**：使用完整播放器播放影片時，視窗可能只顯示黑畫面，UI 仍可顯示或程式未崩潰。
+
+**必須修復的行為**：
+
+1. 首幀可視化：
+   - 載入媒體後，在播放時鐘開始追幀前，必須盡快顯示第一個可解碼視訊幀。
+   - 若 2 秒內未取得任何 decoded frame，UI 必須顯示「等待視訊幀 / 解碼失敗」狀態，而不是只有黑畫面。
+2. Render fallback：
+   - `RenderPipeline` 沒有 `bind_group` / 尚未 `upload_frame()` 時，不得讓使用者誤判為正常播放；必須顯示載入、無畫面或錯誤 overlay。
+   - `render` 層應提供 `has_frame()`、`current_pts()`、`uploaded_frame_count()` 供 UI 顯示診斷資訊。
+3. A/V sync 啟動策略：
+   - `AvSync` 需支援 startup/seek bootstrap：第一個收到的視訊幀在合理範圍內應可先顯示，避免因 audio clock 與 frame PTS 差距導致一直等待。
+   - seek 後應保留上一幀或顯示 seek loading overlay，直到新位置首幀 ready。
+4. Decode worker 可觀測性：
+   - decode worker 必須把 demux/decode 錯誤、已解碼幀數、最後 frame PTS 回傳主執行緒，避免錯誤只在 debug log 中被吞掉。
+   - 對 unsupported codec、extradata 缺失、OBU/NAL 轉換失敗，要轉為 UI 可見錯誤。
+5. Frame 資料驗證：
+   - `DecodedFrame` 上傳前必須驗證 `Y.len()`、`U.len()`、`V.len()` 與實際 plane width/height 相符。
+   - 奇數寬高、非 I420 layout、limited/full range、BT.601/BT.709 色彩矩陣需有明確策略。
+
+### 9.3 優化規格
+
+| 類別 | 新規格 | 驗收標準 |
+|------|--------|----------|
+| 首幀顯示 | 新增 `PlaybackStartupState` 或等價狀態機 | 載入 720p AV1/H.264 測試檔後 2s 內看到第一幀或明確錯誤 |
+| Render 診斷 | render 層暴露 frame count、has_frame、surface error | UI 可顯示目前是否已上傳 frame |
+| 解碼診斷 | worker 回傳 `VideoWorkerStatus` | 黑畫面時可看到 demux/decode/queue 狀態 |
+| 同步策略 | startup 與 seek 使用 bootstrap frame policy | 起播與 seek 後不永久等待 early frame |
+| 效能 | 避免每次 tick clone 大型 `DecodedFrame` | 以 `Arc<DecodedFrame>` 或 frame handle 降低複製成本 |
+| 架構 | 拆分 `player.rs` 中 app/event/render/composition 職責 | `PlayerApp`、render compose、playback state 分檔，單檔複雜度下降 |
+| 測試 | 補黑畫面回歸測試 | `cargo test` 覆蓋 sync bootstrap、frame validation、worker status |
+
+### 9.4 支援格式規格修正
+
+既有文件宣稱 H.264/H.265 為非目標，但目前程式碼已包含 `video/h264.rs`、`video/h265.rs` 與 `VideoDecoder::{Av1,H264,H265}`。後續規格改為：
+
+- AV1/MP4：主要支援路徑，必須保持可播放。
+- H.264/MP4：實驗支援，需補足測試素材與錯誤回報。
+- H.265/MP4：實驗支援，需確認 `rust_h265` 解碼能力與實測限制。
+- 不支援或失敗的 codec 必須顯示清楚錯誤，不得靜默黑畫面。
