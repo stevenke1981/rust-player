@@ -900,7 +900,63 @@ pub fn run_render_only(path: &Path) -> Result<()> {
                                 }
                             }
                         }
-                        let _ = render.render();
+                        // Handle surface errors gracefully (same pattern as PlayerApp::redraw).
+                        let output = match render.surface.get_current_texture() {
+                            Ok(t) => t,
+                            Err(wgpu::SurfaceError::Lost) => {
+                                log::warn!("render-only surface lost, reconfiguring");
+                                render.reconfigure_surface();
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                                return;
+                            }
+                            Err(wgpu::SurfaceError::Outdated) => {
+                                log::debug!("render-only surface outdated, skipping frame");
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                                return;
+                            }
+                            Err(e) => {
+                                log::error!("render-only surface error: {e}");
+                                if let Some(w) = &self.window {
+                                    w.request_redraw();
+                                }
+                                return;
+                            }
+                        };
+                        let view = output
+                            .texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+                        let mut encoder = render
+                            .device
+                            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                                label: Some("render_only_encoder"),
+                            });
+                        {
+                            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                                label: Some("render_only_pass"),
+                                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                    view: &view,
+                                    resolve_target: None,
+                                    ops: wgpu::Operations {
+                                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                                        store: wgpu::StoreOp::Store,
+                                    },
+                                })],
+                                depth_stencil_attachment: None,
+                                occlusion_query_set: None,
+                                timestamp_writes: None,
+                            });
+                            if let Some(bind_group) = &render.bind_group {
+                                pass.set_pipeline(&render.pipeline);
+                                pass.set_bind_group(0, bind_group, &[]);
+                                pass.draw(0..6, 0..1);
+                            }
+                        }
+                        render.queue.submit(std::iter::once(encoder.finish()));
+                        output.present();
                     }
                     if let Some(w) = &self.window {
                         w.request_redraw();
