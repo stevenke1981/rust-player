@@ -27,6 +27,7 @@ pub fn copy_yuv420_plane(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn pack_i420(
     pts_secs: f64,
     width: u32,

@@ -29,7 +29,7 @@ enum DemuxBackend {
         sample_index: usize,
     },
     Mp4Crate {
-        reader: mp4::Mp4Reader<BufReader<File>>,
+        reader: Box<mp4::Mp4Reader<BufReader<File>>>,
         track_id: u32,
         sample_index: usize,
         sample_count: u32,
@@ -105,7 +105,7 @@ impl Mp4Demuxer {
 
         Ok(Self {
             backend: DemuxBackend::Mp4Crate {
-                reader: mp4,
+                reader: Box::new(mp4),
                 track_id,
                 sample_index: 0,
                 sample_count,
@@ -325,13 +325,7 @@ fn avcc_from_mp4_track(track: &mp4::Mp4Track) -> Vec<u8> {
         return Vec::new();
     }
 
-    let mut out = Vec::new();
-    out.push(1);
-    out.push(sps[1]);
-    out.push(sps[2]);
-    out.push(sps[3]);
-    out.push(0xff);
-    out.push(0xe0 | 1);
+    let mut out = vec![1, sps[1], sps[2], sps[3], 0xff, 0xe0 | 1];
     out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
     out.extend_from_slice(sps);
     out.push(1);

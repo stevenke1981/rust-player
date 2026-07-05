@@ -207,7 +207,7 @@ fn decode_thread_count() -> i32 {
 pub enum VideoDecoder {
     Av1(Av1Decoder),
     H264(H264Decoder),
-    H265(H265Decoder),
+    H265(Box<H265Decoder>),
 }
 
 impl VideoDecoder {
@@ -215,7 +215,7 @@ impl VideoDecoder {
         match codec {
             VideoCodec::Av1 => Ok(Self::Av1(Av1Decoder::new()?)),
             VideoCodec::H264 => Ok(Self::H264(H264Decoder::new(extradata)?)),
-            VideoCodec::H265 => Ok(Self::H265(H265Decoder::new(extradata)?)),
+            VideoCodec::H265 => Ok(Self::H265(Box::new(H265Decoder::new(extradata)?))),
             VideoCodec::Unknown => Err(PlayerError::VideoDecode(
                 "unsupported video codec".into(),
             )),
