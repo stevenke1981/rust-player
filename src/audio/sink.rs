@@ -6,10 +6,11 @@ use crate::audio::output::AudioOutput;
 use crate::error::{PlayerError, Result};
 
 /// Null audio sink for environments without an output device (e.g. remote desktop).
-/// Advances the playback clock as if samples were rendered, keeping A/V sync alive.
+/// Samples are discarded; the player drives the master clock from wall time.
 pub struct VirtualAudioOutput {
     channels: u16,
     sample_rate: u32,
+    #[allow(dead_code)]
     clock: Arc<PlaybackClock>,
     paused: AtomicBool,
     volume: AtomicU32,
@@ -27,23 +28,16 @@ impl VirtualAudioOutput {
     }
 
     pub fn write(&self, samples: &[f32]) -> Result<()> {
-        if !self.paused.load(Ordering::Relaxed) {
-            let ch = self.channels as usize;
-            if let Some(frames) = samples.len().checked_div(ch) {
-                self.clock.on_samples_played(frames as u64);
-            }
-        }
+        let _ = (self.paused.load(Ordering::Relaxed), samples.len());
         Ok(())
     }
 
     pub fn pause(&self) {
         self.paused.store(true, Ordering::Relaxed);
-        self.clock.pause();
     }
 
     pub fn resume(&self) {
         self.paused.store(false, Ordering::Relaxed);
-        self.clock.resume();
     }
 
     pub fn clear(&self) {}
@@ -147,19 +141,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn virtual_sink_advances_clock() {
+    fn virtual_sink_does_not_advance_clock() {
         let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
         let sink = VirtualAudioOutput::new(48_000, 2, clock.clone());
-        let samples = vec![0.0f32; 96_000];
-        sink.write(&samples).unwrap();
-        assert!((clock.position_secs() - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn virtual_sink_respects_pause() {
-        let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
-        let sink = VirtualAudioOutput::new(48_000, 2, clock.clone());
-        sink.pause();
         sink.write(&vec![0.0f32; 96_000]).unwrap();
         assert!((clock.position_secs()).abs() < 1e-6);
     }

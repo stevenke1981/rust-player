@@ -33,13 +33,6 @@ impl AvSync {
     }
 
     pub fn push_frame(&mut self, frame: DecodedFrame) {
-        let audio_pts = self.clock.position_secs();
-
-        if frame.pts_secs < audio_pts - self.sync_threshold_secs {
-            self.dropped_late += 1;
-            return;
-        }
-
         while self.frame_queue.len() >= self.max_queue_frames {
             self.frame_queue.pop_front();
             self.dropped_overflow += 1;
@@ -49,23 +42,47 @@ impl AvSync {
     }
 
     pub fn pop_frame_for_display(&mut self) -> Option<DecodedFrame> {
-        let audio_pts = self.clock.position_secs();
-
-        while let Some(frame) = self.frame_queue.front() {
-            if frame.pts_secs > audio_pts + self.sync_threshold_secs {
-                self.waited_early += 1;
-                return None;
-            }
-
-            let frame = self.frame_queue.pop_front().unwrap();
-            if frame.pts_secs < audio_pts - self.sync_threshold_secs {
-                self.dropped_late += 1;
-                continue;
-            }
-            return Some(frame);
+        if self.frame_queue.is_empty() {
+            return None;
         }
 
-        None
+        let audio_pts = self.clock.position_secs();
+        let mut best_idx = None;
+
+        for (i, frame) in self.frame_queue.iter().enumerate() {
+            if frame.pts_secs <= audio_pts + self.sync_threshold_secs {
+                best_idx = Some(i);
+            }
+        }
+
+        if let Some(idx) = best_idx {
+            for _ in 0..idx {
+                self.frame_queue.pop_front();
+                self.dropped_late += 1;
+            }
+            return self.frame_queue.pop_front();
+        }
+
+        if self
+            .frame_queue
+            .front()
+            .is_some_and(|f| f.pts_secs > audio_pts + self.sync_threshold_secs)
+        {
+            self.waited_early += 1;
+            if audio_pts <= self.sync_threshold_secs
+                && self
+                    .frame_queue
+                    .front()
+                    .is_some_and(|f| f.pts_secs <= self.sync_threshold_secs)
+            {
+                return self.frame_queue.pop_front();
+            }
+            return None;
+        }
+
+        let late_count = self.frame_queue.len().saturating_sub(1) as u64;
+        self.dropped_late += late_count;
+        self.frame_queue.pop_back()
     }
 
     pub fn clear(&mut self) {
@@ -82,13 +99,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sync_drops_late_frame() {
+    fn sync_queues_all_incoming_frames() {
         let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
-        clock.on_samples_played(480_000); // 10s
+        clock.on_samples_played(480_000);
         let mut sync = AvSync::new(clock);
 
         sync.push_frame(make_frame(1.0));
-        assert_eq!(sync.dropped_late, 1);
+        sync.push_frame(make_frame(2.0));
+        assert_eq!(sync.queue_len(), 2);
     }
 
     #[test]
@@ -99,6 +117,29 @@ mod tests {
         sync.push_frame(make_frame(5.0));
         assert!(sync.pop_frame_for_display().is_none());
         assert_eq!(sync.waited_early, 1);
+    }
+
+    #[test]
+    fn sync_bootstraps_start_of_stream() {
+        let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
+        let mut sync = AvSync::new(clock);
+
+        sync.push_frame(make_frame(0.0));
+        let frame = sync.pop_frame_for_display().expect("bootstrap frame");
+        assert!((frame.pts_secs - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sync_catches_up_when_video_lags() {
+        let clock = Arc::new(PlaybackClock::new(48_000, Some(10.0)));
+        clock.seek(2.0);
+        let mut sync = AvSync::new(clock);
+
+        sync.push_frame(make_frame(0.0));
+        sync.push_frame(make_frame(0.5));
+        sync.push_frame(make_frame(1.0));
+        let frame = sync.pop_frame_for_display().expect("catch-up frame");
+        assert!((frame.pts_secs - 1.0).abs() < 1e-6);
     }
 
     #[test]

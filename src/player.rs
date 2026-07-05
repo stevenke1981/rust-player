@@ -34,8 +34,10 @@ pub struct MediaPlayer {
     pending_audio: Vec<f32>,
     output_playing: bool,
     last_volume: f32,
-    video_only_clock: bool,
-    last_tick: Instant,
+    wall_clock_drive: bool,
+    wall_anchor_secs: f64,
+    wall_anchor_time: Option<Instant>,
+    last_video_frame: Option<DecodedFrame>,
 }
 
 impl MediaPlayer {
@@ -76,7 +78,8 @@ impl MediaPlayer {
         };
         let av_sync = AvSync::new(clock.clone());
         let subtitles = SubtitleTrack::load_sidecar(path);
-        let video_only_clock = audio_decoder.is_none() && has_video;
+        let wall_clock_drive =
+            audio_sink.is_virtual() || (audio_decoder.is_none() && has_video);
 
         Ok(Self {
             audio_decoder,
@@ -88,9 +91,30 @@ impl MediaPlayer {
             pending_audio: Vec::new(),
             output_playing: false,
             last_volume: 1.0,
-            video_only_clock,
-            last_tick: Instant::now(),
+            wall_clock_drive,
+            wall_anchor_secs: 0.0,
+            wall_anchor_time: None,
+            last_video_frame: None,
         })
+    }
+
+    fn start_wall_clock(&mut self) {
+        self.wall_anchor_secs = self.clock.position_secs();
+        self.wall_anchor_time = Some(Instant::now());
+    }
+
+    fn stop_wall_clock(&mut self) {
+        if let Some(start) = self.wall_anchor_time {
+            self.wall_anchor_secs += start.elapsed().as_secs_f64();
+        }
+        self.wall_anchor_time = None;
+    }
+
+    fn advance_wall_clock(&mut self) {
+        if let Some(start) = self.wall_anchor_time {
+            let pos = self.wall_anchor_secs + start.elapsed().as_secs_f64();
+            self.clock.seek(pos);
+        }
     }
 
     pub fn uses_virtual_audio(&self) -> bool {
@@ -113,21 +137,23 @@ impl MediaPlayer {
             if !self.output_playing {
                 self.audio_sink.resume();
                 self.output_playing = true;
-                self.last_tick = Instant::now();
+                if self.wall_clock_drive {
+                    self.start_wall_clock();
+                }
             }
         } else {
             if self.output_playing {
                 self.audio_sink.pause();
+                if self.wall_clock_drive {
+                    self.stop_wall_clock();
+                }
                 self.output_playing = false;
             }
-            return None;
+            return self.last_video_frame.clone();
         }
 
-        if self.video_only_clock {
-            let elapsed = self.last_tick.elapsed();
-            self.last_tick = Instant::now();
-            let pos = self.clock.position_secs() + elapsed.as_secs_f64();
-            self.clock.seek(pos);
+        if self.wall_clock_drive {
+            self.advance_wall_clock();
         }
 
         let channels = self.audio_sink.channels() as usize;
@@ -152,7 +178,12 @@ impl MediaPlayer {
             worker.poll_frames(&mut self.av_sync);
         }
 
-        self.av_sync.pop_frame_for_display()
+        if let Some(frame) = self.av_sync.pop_frame_for_display() {
+            self.last_video_frame = Some(frame.clone());
+            Some(frame)
+        } else {
+            self.last_video_frame.clone()
+        }
     }
 
     pub fn set_volume(&self, level: f32) {
@@ -187,13 +218,19 @@ impl MediaPlayer {
 
     pub fn seek(&mut self, position_secs: f64) -> Result<()> {
         self.audio_sink.clear();
-        self.last_tick = Instant::now();
         self.pending_audio.clear();
         self.av_sync.clear();
+        self.last_video_frame = None;
         if let Some(dec) = &mut self.audio_decoder {
             dec.seek(position_secs)?;
         }
         self.clock.seek(position_secs);
+        self.wall_anchor_secs = position_secs;
+        if self.output_playing && self.wall_clock_drive {
+            self.wall_anchor_time = Some(Instant::now());
+        } else {
+            self.wall_anchor_time = None;
+        }
         if let Some(worker) = &self.video_worker {
             worker.seek(position_secs);
         }
