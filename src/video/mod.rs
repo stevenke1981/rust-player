@@ -5,9 +5,11 @@ mod h264;
 mod h265;
 mod nal;
 mod obu;
+mod worker;
 
 pub use decoder::{Av1Decoder, DecodedFrame, VideoDecoder};
 pub use demux::{Mp4Demuxer, VideoCodec, VideoPacket};
+pub use worker::VideoDecodeWorker;
 
 use std::path::Path;
 

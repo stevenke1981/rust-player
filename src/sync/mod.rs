@@ -20,7 +20,7 @@ impl AvSync {
             clock,
             frame_queue: VecDeque::new(),
             sync_threshold_secs: 0.040,
-            max_queue_frames: 8,
+            max_queue_frames: 12,
             dropped_late: 0,
             dropped_overflow: 0,
             waited_early: 0,

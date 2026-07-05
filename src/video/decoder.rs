@@ -28,8 +28,8 @@ impl Av1Decoder {
         unsafe {
             dav1d_default_settings(NonNull::new(&mut settings).unwrap());
         }
-        settings.n_threads = 2;
-        settings.max_frame_delay = 1;
+        settings.n_threads = decode_thread_count();
+        settings.max_frame_delay = 2;
 
         let mut context = None;
         let res = unsafe {
@@ -196,6 +196,12 @@ fn extract_frame(picture: &Dav1dPicture, pts_secs: f64) -> Option<DecodedFrame> 
         y_stride: width as usize,
         uv_stride: uv_w,
     })
+}
+
+fn decode_thread_count() -> i32 {
+    std::thread::available_parallelism()
+        .map(|n| n.get().clamp(2, 8) as i32)
+        .unwrap_or(2)
 }
 
 pub enum VideoDecoder {

@@ -16,30 +16,32 @@ use crate::i18n::{Language, Locale};
 use crate::render::RenderPipeline;
 use crate::sync::AvSync;
 use crate::ui::{apply_theme, draw_player_ui, PlayerUiState, PlayerView};
-use crate::video::{DecodedFrame, Mp4Demuxer, VideoDecoder};
+use crate::video::{DecodedFrame, Mp4Demuxer, VideoDecodeWorker, VideoDecoder};
 
 const MEDIA_EXTENSIONS: &[&str] = &["mp4", "m4a", "mp3"];
 
 const AUDIO_PREFILL_SAMPLES: usize = 4096;
-const MAX_VIDEO_PACKETS_PER_TICK: usize = 4;
 
 pub struct MediaPlayer {
     audio_decoder: Option<AudioDecoder>,
-    video_demuxer: Option<Mp4Demuxer>,
-    video_decoder: VideoDecoder,
+    video_worker: Option<VideoDecodeWorker>,
     audio_output: AudioOutput,
     clock: Arc<PlaybackClock>,
     av_sync: AvSync,
     pending_audio: Vec<f32>,
-    has_video: bool,
     output_playing: bool,
     last_volume: f32,
 }
 
 impl MediaPlayer {
     pub fn open(path: &Path) -> Result<Self> {
-        let video_demuxer = Mp4Demuxer::open(path).ok();
-        let has_video = video_demuxer.is_some();
+        let video_info = Mp4Demuxer::open(path).ok().map(|d| {
+            (
+                d.video_codec(),
+                d.extradata().to_vec(),
+            )
+        });
+        let has_video = video_info.is_some();
 
         let audio_decoder = AudioDecoder::open(path).ok();
         let (sample_rate, channels, duration) = if let Some(ref dec) = audio_decoder {
@@ -58,22 +60,24 @@ impl MediaPlayer {
         }
 
         let audio_output = AudioOutput::new(sample_rate, channels, clock.clone())?;
-        let video_decoder = if let Some(ref demuxer) = video_demuxer {
-            VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata())?
+        let video_worker = if let Some((codec, extradata)) = video_info {
+            Some(VideoDecodeWorker::spawn(
+                path.to_path_buf(),
+                codec,
+                extradata,
+            )?)
         } else {
-            VideoDecoder::for_codec(crate::video::VideoCodec::Av1, &[])?
+            None
         };
         let av_sync = AvSync::new(clock.clone());
 
         Ok(Self {
             audio_decoder,
-            video_demuxer,
-            video_decoder,
+            video_worker,
             audio_output,
             clock,
             av_sync,
             pending_audio: Vec::new(),
-            has_video,
             output_playing: false,
             last_volume: 1.0,
         })
@@ -115,19 +119,8 @@ impl MediaPlayer {
             self.pending_audio.drain(..chunk);
         }
 
-        if self.has_video {
-            if let Some(demuxer) = &mut self.video_demuxer {
-                for _ in 0..MAX_VIDEO_PACKETS_PER_TICK {
-                    let Ok(Some(packet)) = demuxer.next_packet() else {
-                        break;
-                    };
-                    if let Ok(frames) = self.video_decoder.decode(&packet) {
-                        for frame in frames {
-                            self.av_sync.push_frame(frame);
-                        }
-                    }
-                }
-            }
+        if let Some(worker) = &self.video_worker {
+            worker.poll_frames(&mut self.av_sync);
         }
 
         self.av_sync.pop_frame_for_display()
@@ -171,10 +164,8 @@ impl MediaPlayer {
             dec.seek(position_secs)?;
         }
         self.clock.seek(position_secs);
-        if let Some(demuxer) = &mut self.video_demuxer {
-            demuxer.seek(position_secs)?;
-            self.video_decoder =
-                VideoDecoder::for_codec(demuxer.video_codec(), demuxer.extradata())?;
+        if let Some(worker) = &self.video_worker {
+            worker.seek(position_secs);
         }
         Ok(())
     }
